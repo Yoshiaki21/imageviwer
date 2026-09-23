@@ -5,6 +5,7 @@
 //! its explanation, and a serializer cannot emit comments.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -17,6 +18,8 @@ pub struct Config {
     pub window: Option<WindowConfig>,
     #[serde(default)]
     pub last_opened: Option<LastOpened>,
+    #[serde(default)]
+    pub overlay: OverlayConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
 }
@@ -37,6 +40,33 @@ pub struct WindowConfig {
 pub struct LastOpened {
     pub folder: PathBuf,
     pub index: usize,
+}
+
+/// The folder / file caption shown when the image changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayConfig {
+    /// How long the caption stays up, in milliseconds. 0 turns it off.
+    #[serde(default = "default_overlay_duration_ms")]
+    pub duration_ms: u64,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            duration_ms: default_overlay_duration_ms(),
+        }
+    }
+}
+
+impl OverlayConfig {
+    pub fn duration(&self) -> Duration {
+        Duration::from_millis(self.duration_ms)
+    }
+}
+
+fn default_overlay_duration_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +165,13 @@ impl Config {
             out.push('\n');
         }
 
+        out.push_str("[overlay]\n");
+        out.push_str(
+            "# 画像切り替え時にフォルダ名・ファイル名を表示する時間（ミリ秒）。0 で表示しない。\n",
+        );
+        out.push_str(&format!("duration_ms = {}\n", self.overlay.duration_ms));
+        out.push('\n');
+
         out.push_str("[logging]\n");
         out.push_str(&format!(
             "enabled = {}          # ログ出力する/しない（未指定時のデフォルト: true）\n",
@@ -225,6 +262,7 @@ mod tests {
                 folder: PathBuf::from(r"C:\Users\yoshiaki\Pictures\sample"),
                 index: 5,
             }),
+            overlay: OverlayConfig { duration_ms: 1500 },
             logging: LoggingConfig::default(),
         };
 
@@ -234,6 +272,21 @@ mod tests {
         let last = parsed.last_opened.expect("last_opened section");
         assert_eq!(last.folder, PathBuf::from(r"C:\Users\yoshiaki\Pictures\sample"));
         assert_eq!(last.index, 5);
+        assert_eq!(parsed.overlay.duration_ms, 1500);
+    }
+
+    #[test]
+    fn overlay_duration_defaults_to_five_seconds() {
+        let config: Config = toml::from_str("[overlay]\n").expect("parses");
+        assert_eq!(config.overlay.duration_ms, 5000);
+        assert_eq!(Config::default().overlay.duration_ms, 5000);
+    }
+
+    #[test]
+    fn a_zero_overlay_duration_is_kept() {
+        let config: Config = toml::from_str("[overlay]\nduration_ms = 0\n").expect("parses");
+        assert!(config.overlay.duration().is_zero());
+        assert!(config.to_toml().contains("\nduration_ms = 0\n"));
     }
 
     #[test]

@@ -1,14 +1,23 @@
 //! The window contents: one image, letterboxed on black (spec §5), driven by
-//! the arrow keys and Enter (spec §4).
+//! the keyboard and mouse (spec §4), with a caption naming the folder and file
+//! for a few seconds after each change.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::*;
 
 use crate::config::{Config, LastOpened, WindowConfig};
 use crate::library::{self, Step};
 use crate::media;
+use crate::natural_sort::natural_cmp_paths;
+use crate::pointer::{self, ClickArea, WheelNotches};
+use crate::report;
+
+/// How long the caption takes to fade out at the end of its display time.
+const CAPTION_FADE: Duration = Duration::from_millis(300);
 
 /// Key context for the viewer's bindings.
 pub const KEY_CONTEXT: &str = "ImageViewer";
@@ -21,6 +30,7 @@ gpui_kit::actions!(
         NextFolder,
         PreviousFolder,
         ToggleFullscreen,
+        DeleteImage,
         Quit,
     ]
 );
@@ -33,6 +43,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", NextFolder, Some(KEY_CONTEXT)),
         KeyBinding::new("up", PreviousFolder, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", ToggleFullscreen, Some(KEY_CONTEXT)),
+        KeyBinding::new("delete", DeleteImage, Some(KEY_CONTEXT)),
         // Not in the spec, but a fullscreen window has no close button.
         KeyBinding::new("ctrl-q", Quit, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", Quit, Some(KEY_CONTEXT)),
@@ -63,6 +74,15 @@ enum Content {
     Message(SharedString),
 }
 
+/// The folder / file caption shown at the bottom after the image changes.
+struct Caption {
+    folder: SharedString,
+    file: SharedString,
+    /// Distinguishes each showing, so a new one restarts the fade animation.
+    showing: usize,
+    fading: bool,
+}
+
 pub struct ViewerView {
     focus_handle: FocusHandle,
     content: Content,
@@ -72,21 +92,44 @@ pub struct ViewerView {
     /// instead of the restore rectangle (Wayland reports the restore one), so
     /// the size to save on exit has to be remembered here.
     windowed_bounds: Option<Bounds<Pixels>>,
+    /// From `[overlay] duration_ms`; zero means no caption.
+    caption_duration: Duration,
+    caption: Option<Caption>,
+    /// Hides the caption when it fires; replacing it cancels the old timer.
+    caption_timer: Option<Task<()>>,
+    caption_showings: usize,
+    /// A single click waiting to see whether a second one makes it a double
+    /// click. Dropping the task cancels the click.
+    pending_click: Option<(ClickArea, Task<()>)>,
+    wheel: WheelNotches,
 }
 
 impl ViewerView {
-    pub fn new(startup: Startup, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        startup: Startup,
+        caption_duration: Duration,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let content = match startup {
             Startup::Image(path) => Self::open_file(&path),
             Startup::Restored { folder, index } => Self::open_folder_at(&folder, index),
             Startup::Message(text) => Content::Message(text.into()),
         };
 
-        Self {
+        let mut view = Self {
             focus_handle: cx.focus_handle(),
             content,
             windowed_bounds: None,
-        }
+            caption_duration,
+            caption: None,
+            caption_timer: None,
+            caption_showings: 0,
+            pending_click: None,
+            wheel: WheelNotches::default(),
+        };
+        view.show_caption(cx);
+        view
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,13 +222,121 @@ impl ViewerView {
         window.toggle_fullscreen();
     }
 
+    /// Moves the image on screen to the OS trash and shows the one that
+    /// followed it, wrapping to the first image like → does.
+    fn on_delete_image(&mut self, _: &DeleteImage, window: &mut Window, cx: &mut Context<Self>) {
+        let Content::Gallery(gallery) = &self.content else {
+            return;
+        };
+        let deleted = gallery.entries[gallery.index].clone();
+
+        if let Err(error) = trash::delete(&deleted) {
+            report::error(&format!(
+                "ごみ箱に移動できませんでした。\n{}\n\n{error}",
+                deleted.display()
+            ));
+            return;
+        }
+        log::debug!("moved {} to the trash", deleted.display());
+
+        let folder = gallery.folder.clone();
+        let entries = library::list_images(&folder);
+        // The first file sorting after the deleted one is its successor.
+        let successor = entries
+            .partition_point(|entry| natural_cmp_paths(entry, &deleted) != Ordering::Greater);
+        let start = if successor < entries.len() {
+            successor
+        } else {
+            0
+        };
+        let content = match load_first(
+            &entries,
+            wrapping_indices(entries.len(), start, Step::Forward),
+        ) {
+            Some((index, image)) => Content::Gallery(Gallery {
+                folder,
+                entries,
+                index,
+                image,
+            }),
+            None => Content::Message(message_for_empty_folder(&folder)),
+        };
+        self.replace_content(content, window, cx);
+    }
+
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         self.save_state(window, cx);
         cx.quit();
     }
 
-    /// Moves one image within the current folder. Files that vanished or fail
-    /// to decode are skipped (spec §8).
+    /// Left button: a single click acts on the quarter it landed in, a double
+    /// click toggles fullscreen (spec §4). A single click only acts once the
+    /// double-click interval has passed without a second click, so a double
+    /// click never also changes the image.
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.click_count {
+            1 => {
+                // A click still waiting when a new one starts (too far away to
+                // pair with it) is a single click in its own right.
+                if let Some((area, _)) = self.pending_click.take() {
+                    self.click_area(area, window, cx);
+                }
+                let area = ClickArea::at(event.position, window.viewport_size());
+                let wait = cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(pointer::double_click_interval())
+                        .await;
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        if let Some((area, this_task)) = view.pending_click.take() {
+                            // Dropping would cancel the task that is running.
+                            this_task.detach();
+                            view.click_area(area, window, cx);
+                        }
+                    });
+                });
+                self.pending_click = Some((area, wait));
+            }
+            2 => {
+                self.pending_click = None;
+                log::debug!("toggling fullscreen (double click)");
+                window.toggle_fullscreen();
+            }
+            // A third click in a row would toggle straight back.
+            _ => {}
+        }
+    }
+
+    /// The single-click action of each quarter, mirroring the arrow keys.
+    fn click_area(&mut self, area: ClickArea, window: &mut Window, cx: &mut Context<Self>) {
+        log::debug!("click in {area:?}");
+        match area {
+            ClickArea::TopLeft => self.step_folder(Step::Backward, window, cx),
+            ClickArea::BottomLeft => self.step_image(Step::Backward, window, cx),
+            ClickArea::BottomRight => self.step_image(Step::Forward, window, cx),
+            ClickArea::TopRight => self.step_folder(Step::Forward, window, cx),
+        }
+    }
+
+    /// Wheel down = →, wheel up = ←, one image per notch (spec §4).
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(step) = self.wheel.feed(&event.delta) {
+            self.step_image(step, window, cx);
+        }
+    }
+
+    /// Moves one image within the current folder, wrapping from the last image
+    /// to the first and vice versa. Files that vanished or fail to decode are
+    /// skipped (spec §8).
     fn step_image(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("step image {step:?}");
         let Content::Gallery(gallery) = &self.content else {
@@ -203,17 +354,13 @@ impl ViewerView {
             return;
         };
 
-        let start = match step {
-            Step::Forward => current + 1,
-            Step::Backward => match current.checked_sub(1) {
-                Some(previous) => previous,
-                // Already at the first image; nothing before it.
-                None => return,
-            },
-        };
-
-        let Some((index, image)) = load_scanning(&entries, start, step) else {
-            log::debug!("no further image in this direction");
+        // Every other image once, starting next to the current one; the
+        // current image itself is the last index and is left out.
+        let others = wrapping_indices(entries.len(), current, step)
+            .skip(1)
+            .take(entries.len() - 1);
+        let Some((index, image)) = load_first(&entries, others) else {
+            log::debug!("no other image in this folder");
             return;
         };
 
@@ -269,7 +416,45 @@ impl ViewerView {
             let _ = window.drop_image(previous.image.clone());
         }
         self.content = content;
+        self.show_caption(cx);
         cx.notify();
+    }
+
+    /// Shows the caption for the current image, restarting its timer.
+    fn show_caption(&mut self, cx: &mut Context<Self>) {
+        self.caption = None;
+        self.caption_timer = None;
+        let Content::Gallery(gallery) = &self.content else {
+            return;
+        };
+        if self.caption_duration.is_zero() {
+            return;
+        }
+
+        self.caption_showings += 1;
+        self.caption = Some(Caption {
+            folder: gallery.folder.display().to_string().into(),
+            file: caption_file_line(gallery).into(),
+            showing: self.caption_showings,
+            fading: false,
+        });
+
+        let fade = CAPTION_FADE.min(self.caption_duration);
+        let hold = self.caption_duration - fade;
+        self.caption_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(hold).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(caption) = &mut view.caption {
+                    caption.fading = true;
+                    cx.notify();
+                }
+            });
+            cx.background_executor().timer(fade).await;
+            let _ = this.update(cx, |view, cx| {
+                view.caption = None;
+                cx.notify();
+            });
+        }));
     }
 
     /// Opens the folder containing `path` and shows `path` itself, or the
@@ -316,7 +501,58 @@ impl ViewerView {
     /// the full window, so a future zoom only changes how the image is fitted
     /// and offset inside it (spec §5).
     fn render_image(&self, image: &Arc<RenderImage>) -> impl IntoElement {
-        img(image.clone()).object_fit(ObjectFit::Contain).size_full()
+        img(image.clone())
+            .object_fit(ObjectFit::Contain)
+            .size_full()
+    }
+
+    /// The caption box, centred near the bottom. It has no mouse handlers, so
+    /// clicks on it fall through to the quarter underneath.
+    fn render_caption(&self, caption: &Caption) -> AnyElement {
+        let line = || {
+            div()
+                .w_full()
+                .text_center()
+                .whitespace_nowrap()
+                .overflow_hidden()
+        };
+        let panel = div()
+            .max_w(relative(0.9))
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .bg(rgba(0x000000b3))
+            .text_color(rgb(0xFFFFFF))
+            .text_sm()
+            .flex()
+            .flex_col()
+            .items_center()
+            // Long paths keep their end: the folder being browsed.
+            .child(line().text_ellipsis_start().child(caption.folder.clone()))
+            .child(line().text_ellipsis_middle().child(caption.file.clone()));
+
+        let panel = if caption.fading {
+            let fade = CAPTION_FADE.min(self.caption_duration);
+            panel
+                .with_animation(
+                    ("caption-fade", caption.showing),
+                    Animation::new(fade),
+                    |panel, progress| panel.opacity(1. - progress),
+                )
+                .into_any_element()
+        } else {
+            panel.into_any_element()
+        };
+
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(32.))
+            .flex()
+            .justify_center()
+            .child(panel)
+            .into_any_element()
     }
 }
 
@@ -334,8 +570,12 @@ impl Render for ViewerView {
             .on_action(cx.listener(Self::on_next_folder))
             .on_action(cx.listener(Self::on_previous_folder))
             .on_action(cx.listener(Self::on_toggle_fullscreen))
+            .on_action(cx.listener(Self::on_delete_image))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_action(cx.listener(Self::on_quit))
             .size_full()
+            .relative()
             .flex()
             .items_center()
             .justify_center()
@@ -348,6 +588,11 @@ impl Render for ViewerView {
                     .child(text.clone())
                     .into_any_element(),
             })
+            .children(
+                self.caption
+                    .as_ref()
+                    .map(|caption| self.render_caption(caption)),
+            )
     }
 }
 
@@ -367,7 +612,9 @@ fn load_scanning(
 ) -> Option<(usize, Arc<RenderImage>)> {
     let indices: Vec<usize> = match step {
         Step::Forward => (start..entries.len()).collect(),
-        Step::Backward => (0..=start.min(entries.len().saturating_sub(1))).rev().collect(),
+        Step::Backward => (0..=start.min(entries.len().saturating_sub(1)))
+            .rev()
+            .collect(),
     };
 
     if entries.is_empty() {
@@ -380,6 +627,26 @@ fn load_scanning(
         }
     }
     None
+}
+
+/// All indices of a listing of `len` entries, starting at `start` and
+/// wrapping past either end in the direction of `step`.
+fn wrapping_indices(len: usize, start: usize, step: Step) -> impl Iterator<Item = usize> {
+    (0..len).map(move |offset| match step {
+        Step::Forward => (start + offset) % len,
+        Step::Backward => (start + len - offset) % len,
+    })
+}
+
+/// Loads the first usable image among `indices`, skipping files that no
+/// longer exist or fail to decode (spec §8).
+fn load_first(
+    entries: &[PathBuf],
+    indices: impl IntoIterator<Item = usize>,
+) -> Option<(usize, Arc<RenderImage>)> {
+    indices
+        .into_iter()
+        .find_map(|index| try_load(&entries[index]).map(|image| (index, image)))
 }
 
 /// Loads the image closest to `target`, preferring the lower index when the
@@ -428,27 +695,32 @@ fn try_load(path: &Path) -> Option<Arc<RenderImage>> {
     }
 }
 
-fn message_for_missing(path: &Path) -> SharedString {
+/// "name.png    3 / 25": the file and where it sits in the folder.
+fn caption_file_line(gallery: &Gallery) -> String {
+    let name = gallery.entries[gallery.index]
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     format!(
-        "画像を表示できませんでした。\n{}",
-        path.display()
+        "{name}    {} / {}",
+        gallery.index + 1,
+        gallery.entries.len()
     )
-    .into()
+}
+
+fn message_for_missing(path: &Path) -> SharedString {
+    format!("画像を表示できませんでした。\n{}", path.display()).into()
 }
 
 fn message_for_empty_folder(folder: &Path) -> SharedString {
-    format!(
-        "表示できる画像がありません。\n{}",
-        folder.display()
-    )
-    .into()
+    format!("表示できる画像がありません。\n{}", folder.display()).into()
 }
 
 #[cfg(test)]
 mod tests {
     // Deliberately not `use super::*`: that would re-export GPUI's own `test`
     // attribute over Rust's.
-    use super::{load_nearest, load_scanning, position_of};
+    use super::{load_first, load_nearest, load_scanning, position_of, wrapping_indices};
     use crate::library::{self, Step};
     use crate::test_support::TempTree;
     use std::path::PathBuf;
@@ -528,6 +800,40 @@ mod tests {
         let entries = library::list_images(&folder);
         assert_eq!(entries.len(), 2);
         assert!(load_nearest(&entries, 0).is_none());
+    }
+
+    #[test]
+    fn wrapping_forward_continues_from_the_first_index() {
+        let order: Vec<usize> = wrapping_indices(4, 2, Step::Forward).collect();
+        assert_eq!(order, [2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn wrapping_backward_continues_from_the_last_index() {
+        let order: Vec<usize> = wrapping_indices(4, 1, Step::Backward).collect();
+        assert_eq!(order, [1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn wrapping_an_empty_listing_yields_nothing() {
+        assert_eq!(wrapping_indices(0, 0, Step::Forward).count(), 0);
+    }
+
+    #[test]
+    fn stepping_past_the_last_image_wraps_to_the_first_usable_one() {
+        let (_tree, entries) = folder_with_a_broken_middle("wrap-forward");
+        let others = wrapping_indices(entries.len(), 2, Step::Forward).skip(1);
+        let (index, _) = load_first(&entries, others).expect("an image after wrapping");
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn stepping_before_the_first_image_wraps_past_a_broken_one() {
+        let (_tree, entries) = folder_with_a_broken_middle("wrap-backward");
+        // ← on 1.png wraps round to 3.png.
+        let others = wrapping_indices(entries.len(), 0, Step::Backward).skip(1);
+        let (index, _) = load_first(&entries, others).expect("an image after wrapping");
+        assert_eq!(index, 2);
     }
 
     #[test]

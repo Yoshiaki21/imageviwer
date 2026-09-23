@@ -47,6 +47,10 @@
   `image::Frame` が `gpui::RenderImage` にそのまま渡せる。
 - 設定: `toml 0.9` + `serde`（読み込みのみ。書き出しは手書き。理由は §4）
 - ログ: `log 0.4` + 自前のファイルロガー + `chrono`（タイムスタンプ）
+- ゴミ箱: `trash 5`（Windows のごみ箱と freedesktop の Trash を同じ API で扱えるため。
+  Windows では gpui が初期化済みの STA に合わせる既定の `coinit_apartmentthreaded` のまま使う）
+- マウスの OS 依存値（ダブルクリック間隔・ホイール1ノッチの行数）: Windows は `windows-sys` の
+  `GetDoubleClickTime` / `SPI_GETWHEELSCROLLLINES`、Linux は gpui の固定値（400ms / 3行）に合わせる
 - IPC: Linux はロックファイル + Unix ドメインソケット（std のみ）、Windows は名前付き Mutex +
   名前付きパイプ（`windows-sys 0.60`）
 - スレッド間の受け渡し: `async-channel 2`（IPC スレッド → gpui のフォアグラウンドタスク）
@@ -59,6 +63,10 @@
 | 起動処理・引数処理・ウィンドウ生成・起動時の表示内容の決定 | `src/main.rs` |
 | キー操作の追加／画面の描画／画像の切り替えロジック | `src/viewer.rs` |
 | キーバインドの変更 | `src/viewer.rs` の `bind_keys()` |
+| ←→ のループ（折り返し）・Delete でゴミ箱へ移動 | `src/viewer.rs` の `step_image()` / `on_delete_image()`（巡回順は `wrapping_indices()`） |
+| マウス操作（4分割クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_scroll_wheel()` |
+| クリック位置→エリアの判定、ダブルクリック間隔、ホイールのノッチ換算 | `src/pointer.rs` |
+| フォルダ名・ファイル名の表示（内容・見た目・表示時間の制御） | `src/viewer.rs` の `show_caption()` / `render_caption()`、表示時間は `config.rs` の `OverlayConfig` |
 | 対応画像フォーマットの追加 | `src/media/mod.rs` の `ImageFormat` に列挙子を追加し、`src/media/<形式>.rs` を作る |
 | 画像のデコード処理そのもの | `src/media/png.rs` / `src/media/jpeg.rs`（共通部は `mod.rs` の `decode_as`） |
 | フォルダ走査・次/前の画像・兄弟フォルダ探索 | `src/library.rs` |
@@ -90,6 +98,9 @@
 - **テストモジュールで `use super::*` を書かない（`src/viewer.rs` など gpui を使うファイル）。**
   `gpui_kit::*` に gpui 独自の `test` マクロが含まれており、Rust の `#[test]` を隠して
   「recursion limit reached while expanding `#[test]`」になる。必要な項目だけ個別に import する。
+- **シングルクリックはダブルクリック間隔だけ遅らせて実行する。** ダブルクリックでフルスクリーンにしたとき
+  画像まで移動しないため。待機中のクリックは `pending_click` の `Task` で持ち、drop でキャンセルする。
+- **タイマーは gpui の `Task` をフィールドに保持し、上書き（drop）でキャンセルする。** 表示の消去も同じ方式。
 - 命名は「何であるか」を綴る。`cx` は gpui のもの。
 - 未実装機能（ズーム等）のための抽象化は先回りして作らない。`ViewerView::render_image()` に
   後から手を入れれば済む構造にとどめてある。
@@ -118,6 +129,8 @@ cargo run -- /path/to/image.png
 - **終了時に gpui が `window not found` を ERROR で 1 行出す。** gpui 内部の
   `on_visibility_change` コールバックがウィンドウ破棄後に発火するためで、こちらの不具合ではない。
   `viewer.log` に毎回 1 行残る。
+- **Delete の失敗は `report::error` 経由。** Linux ではメッセージボックスが無く stderr にしか出ないため、
+  KDE ではログ（`viewer.log`）でしか気付けない。
 - 画像は 1 枚ずつ同期デコードする。巨大な画像では切り替え時に一瞬固まる。先読みはしていない。
 - `config.toml` の書き出しは終了時（ウィンドウを閉じる／Esc／Ctrl+Q）のみ。強制終了では保存されない。
 - 複数ファイルの同時オープンには対応しない。`.desktop` の `Exec` は `%F` ではなく `%f`。
@@ -126,6 +139,8 @@ cargo run -- /path/to/image.png
 
 - 2026-09-23: 初回実装。`imageviewer_instructions.md` の全項目を実装。
 - 2026-09-23: Windows 版を実機で確認。コンソール非表示を debug にも適用、関連付けの落とし穴を文書化。
+- 2026-09-23: ←→ のループと Delete（ゴミ箱へ移動）を追加。
+- 2026-09-23: マウス操作（4分割クリック・ダブルクリック・ホイール）とフォルダ名・ファイル名の一時表示を追加。
 
 ---
 
