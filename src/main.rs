@@ -2,8 +2,12 @@
 //!
 //! See `imageviewer_instructions.md` for the behaviour this implements.
 
-// A GUI program should not open a console window on Windows.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A GUI program should never open a console window on Windows. This is
+// deliberately *not* conditional on the build profile: a debug build that keeps
+// the console behaves differently from the release build in exactly the way
+// that hides console-related failures (see `report`). `not(test)` keeps
+// `cargo test` output visible.
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
 mod app_paths;
 mod config;
@@ -12,6 +16,7 @@ mod library;
 mod logging;
 mod media;
 mod natural_sort;
+mod report;
 #[cfg(test)]
 mod test_support;
 mod viewer;
@@ -30,6 +35,9 @@ const MIN_WINDOW_SIZE: (f32, f32) = (400., 300.);
 const DEFAULT_WINDOW_SIZE: (f32, f32) = (1024., 768.);
 
 fn main() {
+    // First, so that anything failing below is reported instead of vanishing.
+    report::install_panic_hook();
+
     let requested_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     // Logging settings come from the config file, so it is read before
@@ -37,6 +45,7 @@ fn main() {
     let config = Config::load();
     logging::init(config.logging.enabled, config.verbose_logging());
     log::debug!("starting with argument {requested_path:?}");
+    panic!("TEMPORARY panic-hook check");
 
     match ipc::acquire() {
         Ok(ipc::Instance::Secondary(secondary)) => {
@@ -44,10 +53,9 @@ fn main() {
             // the way, leaving its window exactly where it is (spec §3).
             match secondary.send(requested_path.as_deref()) {
                 Ok(()) => log::debug!("handed the path to the running viewer"),
-                Err(error) => {
-                    log::error!("cannot reach the running viewer: {error:#}");
-                    eprintln!("imageviewer: cannot reach the running viewer: {error:#}");
-                }
+                Err(error) => report::error(&format!(
+                    "起動中のビュワーに画像を渡せませんでした。\n\n{error:#}"
+                )),
             }
         }
         Ok(ipc::Instance::Primary(primary)) => {
@@ -73,14 +81,25 @@ fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: C
 
             let options = window_options(cx);
             let mut viewer: Option<Entity<ViewerView>> = None;
-            let window = cx
-                .open_window(options, |window, cx| {
-                    let view = cx.new(|cx| ViewerView::new(startup, window, cx));
-                    viewer = Some(view.clone());
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .expect("opening the viewer window");
-            let viewer = viewer.expect("the root view was built");
+            let opened = cx.open_window(options, |window, cx| {
+                let view = cx.new(|cx| ViewerView::new(startup, window, cx));
+                viewer = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            });
+
+            let (window, viewer) = match (opened, viewer) {
+                (Ok(window), Some(viewer)) => (window, viewer),
+                (Err(error), _) => {
+                    report::error(&format!("ウィンドウを開けませんでした。\n\n{error:#}"));
+                    cx.quit();
+                    return;
+                }
+                (Ok(_), None) => {
+                    report::error("ウィンドウの初期化に失敗しました。");
+                    cx.quit();
+                    return;
+                }
+            };
 
             let _ = window.update(cx, |_root, window, cx| {
                 window.activate_window();

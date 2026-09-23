@@ -7,15 +7,14 @@
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Result};
 use windows_sys::core::{BOOL, PCWSTR};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
-    PIPE_ACCESS_INBOUND,
+    CreateFileW, ReadFile, WriteFile, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -96,7 +95,10 @@ impl Secondary {
         let handle = unsafe {
             CreateFileW(
                 self.pipe_name.as_ptr() as PCWSTR,
-                FILE_GENERIC_WRITE,
+                // `GENERIC_WRITE`, not `FILE_GENERIC_WRITE`: a named pipe's
+                // security descriptor grants the generic right, and asking for
+                // the expanded specific rights can come back ACCESS_DENIED.
+                GENERIC_WRITE,
                 FILE_SHARE_NONE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -171,11 +173,11 @@ fn accept_once(pipe_name: &[u16]) -> Result<Option<PathBuf>> {
     // SAFETY: `pipe` is a valid, connected pipe handle.
     unsafe { DisconnectNamedPipe(pipe.0) };
 
-    let bytes = bytes?;
     Ok(decode_path(&bytes))
 }
 
-fn read_to_end(pipe: &OwnedHandle) -> Result<Vec<u8>> {
+/// Reads until the client closes its end, which is how a request ends.
+fn read_to_end(pipe: &OwnedHandle) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -196,7 +198,7 @@ fn read_to_end(pipe: &OwnedHandle) -> Result<Vec<u8>> {
         }
         bytes.extend_from_slice(&chunk[..read as usize]);
     }
-    Ok(bytes)
+    bytes
 }
 
 /// Paths travel as UTF-16, the encoding Windows itself uses, so nothing is

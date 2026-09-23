@@ -104,7 +104,10 @@ fn open_log(path: &Path) -> Option<File> {
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(file) => Some(file),
         Err(error) => {
-            eprintln!("imageviewer: cannot open {}: {error}", path.display());
+            // Not being able to log is not a reason to refuse to show images,
+            // and printing here would panic in a GUI-subsystem process. Record
+            // the reason so any later error dialog can mention it.
+            crate::report::set_log_unavailable(format!("{}: {error}", path.display()));
             None
         }
     }
