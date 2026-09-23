@@ -1,15 +1,10 @@
 //! Telling the user about a problem when there is no console to print to.
 //!
 //! On Windows the viewer is a GUI-subsystem program. When Explorer starts it —
-//! which is what a file association does — the process has no console at all,
-//! `GetStdHandle` returns null, and `println!` / `eprintln!` **panic** with
-//! "failed printing to stderr". A panic in a GUI-subsystem process produces no
-//! visible output, so the program simply appears to do nothing.
-//!
-//! Started from `cmd.exe` the same binary inherits that console's handles and
-//! the print succeeds, which is why the failure only shows up via the file
-//! association. Nothing in this crate may write to stdio; every user-facing
-//! problem goes through here instead.
+//! which is what a file association does — there is no console, so anything
+//! written to stdout / stderr is silently discarded and a failure would leave
+//! no visible trace. Every user-facing problem goes through here instead: it is
+//! logged and shown in a message box.
 
 use std::sync::OnceLock;
 

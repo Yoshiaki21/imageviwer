@@ -86,6 +86,19 @@ C:\Users\<ユーザー名>\Apps\imageviewer\imageviewer.exe
 4. **常にこのアプリを使う** にチェック
 5. `.jpg` / `.jpeg` についても同じ操作を行う
 
+> **注意: 実行ファイルの場所を変えたとき（debug → release など）**
+>
+> Windows は「プログラムから開く」で選んだアプリを **ファイル名だけ**（`imageviewer.exe`）で覚えており、
+> 最初に登録したパスを
+> `HKEY_CURRENT_USER\Software\Classes\Applications\imageviewer.exe\shell\open\command`
+> に保存したまま更新しません。別の場所の `imageviewer.exe` を選び直しても古いパスが起動されるため、
+> 古いパスが消えている（`cargo clean` 後の `target\debug` など）と、関連付けから開いても何も起きません。
+> 次のコマンドで登録パスを実際の配置先に書き換えてください。
+>
+> ```powershell
+> Set-ItemProperty 'HKCU:\Software\Classes\Applications\imageviewer.exe\shell\open\command' '(default)' '"C:\Users\<ユーザー名>\Apps\imageviewer\imageviewer.exe" "%1"'
+> ```
+
 ### 3. レジストリで設定する（複数台に配る場合）
 
 `imageviewer-register.reg` として保存し、パスを実際の配置先に書き換えてから実行します。

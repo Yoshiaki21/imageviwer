@@ -66,6 +66,7 @@
 | `config.toml` の項目追加・書式変更 | `src/config.rs` |
 | ログの出力先・書式・フィルタ | `src/logging.rs` |
 | `config.toml` / `viewer.log` の置き場所 | `src/app_paths.rs` |
+| エラーをユーザーに見せる（メッセージボックス・パニックフック） | `src/report.rs` |
 | 多重起動制御・既存ウィンドウへのパス受け渡し | `src/ipc/mod.rs`（共通 API）、`src/ipc/unix.rs`、`src/ipc/windows.rs` |
 | テスト用の一時ディレクトリ・テスト画像の生成 | `src/test_support.rs`（`#[cfg(test)]` のみ） |
 | ファイル関連付けの手順書 | `docs/file-association.md` |
@@ -105,10 +106,11 @@ cargo run -- /path/to/image.png
 
 ### 6. 既知の制約・注意点
 
-- **Windows 実装はコンパイル未検証。** 開発機に Windows ターゲットの std が無く
-  （rustup 不在、`x86_64-unknown-linux-gnu` のみ）、`src/ipc/windows.rs` は
-  windows-sys 0.60 のシグネチャを直接読んで書いたもの。Windows で最初にビルドするときは
-  ここを疑う。
+- **Windows は debug / release とも GUI サブシステム（コンソールなし）。** 標準出力は捨てられるので、
+  ユーザーに見せるエラーは `src/report.rs`（ログ + メッセージボックス）経由で出す。
+- **Windows の「プログラムから開く」は exe のファイル名だけで登録される。**
+  `HKCU\Software\Classes\Applications\imageviewer.exe` のパスは別の場所の同名 exe を選んでも更新されない。
+  「関連付けで開くと何も起きない」ときはまずここを疑う（手順は `docs/file-association.md`）。
 - **X11 は `window_bounds()` がフルスクリーン中に復元サイズを返さない。** Wayland は
   `WindowBounds::Fullscreen(復元サイズ)` を返すが、X11 は常に `Windowed(現在のサイズ)` を返す。
   そのため `ViewerView` がウィンドウモード時の矩形を自分で覚えている（`windowed_bounds`）。
@@ -123,6 +125,7 @@ cargo run -- /path/to/image.png
 ### 7. 変更履歴
 
 - 2026-09-23: 初回実装。`imageviewer_instructions.md` の全項目を実装。
+- 2026-09-23: Windows 版を実機で確認。コンソール非表示を debug にも適用、関連付けの落とし穴を文書化。
 
 ---
 

@@ -3,10 +3,9 @@
 //! See `imageviewer_instructions.md` for the behaviour this implements.
 
 // A GUI program should never open a console window on Windows. This is
-// deliberately *not* conditional on the build profile: a debug build that keeps
-// the console behaves differently from the release build in exactly the way
-// that hides console-related failures (see `report`). `not(test)` keeps
-// `cargo test` output visible.
+// deliberately *not* conditional on the build profile, so debug and release
+// builds start the same way; problems are reported through `report` instead
+// of a console. `not(test)` keeps `cargo test` output visible.
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
 mod app_paths;
@@ -45,7 +44,6 @@ fn main() {
     let config = Config::load();
     logging::init(config.logging.enabled, config.verbose_logging());
     log::debug!("starting with argument {requested_path:?}");
-    panic!("TEMPORARY panic-hook check");
 
     match ipc::acquire() {
         Ok(ipc::Instance::Secondary(secondary)) => {
