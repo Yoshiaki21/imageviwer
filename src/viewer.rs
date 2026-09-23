@@ -31,6 +31,7 @@ gpui_kit::actions!(
         PreviousFolder,
         ToggleFullscreen,
         DeleteImage,
+        RandomImage,
         Quit,
     ]
 );
@@ -44,6 +45,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PreviousFolder, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", ToggleFullscreen, Some(KEY_CONTEXT)),
         KeyBinding::new("delete", DeleteImage, Some(KEY_CONTEXT)),
+        KeyBinding::new("r", RandomImage, Some(KEY_CONTEXT)),
         // Not in the spec, but a fullscreen window has no close button.
         KeyBinding::new("ctrl-q", Quit, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", Quit, Some(KEY_CONTEXT)),
@@ -274,6 +276,40 @@ impl ViewerView {
         self.replace_content(content, window, cx);
     }
 
+    fn on_random_image(&mut self, _: &RandomImage, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_random_image(window, cx);
+    }
+
+    /// Jumps to a randomly chosen other image in the current folder. Files
+    /// that vanished or fail to decode are skipped by drawing again (spec §8).
+    fn show_random_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::debug!("random image");
+        let Content::Gallery(gallery) = &self.content else {
+            return;
+        };
+
+        // Re-read the folder so deletions made elsewhere are noticed.
+        let entries = library::list_images(&gallery.folder);
+        let current = position_of(&entries, &gallery.entries, gallery.index);
+        let Some((index, image)) = load_first(&entries, shuffled_others(entries.len(), current))
+        else {
+            log::debug!("no other image in this folder");
+            return;
+        };
+
+        let folder = gallery.folder.clone();
+        self.replace_content(
+            Content::Gallery(Gallery {
+                folder,
+                entries,
+                index,
+                image,
+            }),
+            window,
+            cx,
+        );
+    }
+
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         self.save_state(window, cx);
         cx.quit();
@@ -318,6 +354,22 @@ impl ViewerView {
             }
             // A third click in a row would toggle straight back.
             _ => {}
+        }
+    }
+
+    /// Right button: the bottom quarters show a random image, like R. There is
+    /// no right double click, so this acts at once.
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let area = ClickArea::at(event.position, window.viewport_size());
+        log::debug!("right click in {area:?}");
+        match area {
+            ClickArea::BottomLeft | ClickArea::BottomRight => self.show_random_image(window, cx),
+            ClickArea::TopLeft | ClickArea::TopRight => {}
         }
     }
 
@@ -602,7 +654,9 @@ impl Render for ViewerView {
             .on_action(cx.listener(Self::on_previous_folder))
             .on_action(cx.listener(Self::on_toggle_fullscreen))
             .on_action(cx.listener(Self::on_delete_image))
+            .on_action(cx.listener(Self::on_random_image))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_action(cx.listener(Self::on_quit))
             .size_full()
@@ -667,6 +721,14 @@ fn wrapping_indices(len: usize, start: usize, step: Step) -> impl Iterator<Item 
         Step::Forward => (start + offset) % len,
         Step::Backward => (start + len - offset) % len,
     })
+}
+
+/// Every index of a listing of `len` entries except `current`, in random
+/// order.
+fn shuffled_others(len: usize, current: Option<usize>) -> Vec<usize> {
+    let mut others: Vec<usize> = (0..len).filter(|&index| Some(index) != current).collect();
+    fastrand::shuffle(&mut others);
+    others
 }
 
 /// Loads the first usable image among `indices`, skipping files that no
@@ -751,7 +813,9 @@ fn message_for_empty_folder(folder: &Path) -> SharedString {
 mod tests {
     // Deliberately not `use super::*`: that would re-export GPUI's own `test`
     // attribute over Rust's.
-    use super::{load_first, load_nearest, load_scanning, position_of, wrapping_indices};
+    use super::{
+        load_first, load_nearest, load_scanning, position_of, shuffled_others, wrapping_indices,
+    };
     use crate::library::{self, Step};
     use crate::test_support::TempTree;
     use std::path::PathBuf;
@@ -865,6 +929,36 @@ mod tests {
         let others = wrapping_indices(entries.len(), 0, Step::Backward).skip(1);
         let (index, _) = load_first(&entries, others).expect("an image after wrapping");
         assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn shuffled_others_leaves_out_only_the_current_image() {
+        let mut others = shuffled_others(5, Some(2));
+        others.sort_unstable();
+        assert_eq!(others, [0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn shuffled_others_of_a_single_image_is_empty() {
+        assert!(shuffled_others(1, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn shuffled_others_without_a_current_image_offers_every_index() {
+        let mut others = shuffled_others(3, None);
+        others.sort_unstable();
+        assert_eq!(others, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_random_pick_skips_an_undecodable_file() {
+        let (_tree, entries) = folder_with_a_broken_middle("random-broken");
+        // From 1.png the only usable other image is 3.png, whatever the order.
+        for _ in 0..20 {
+            let (index, _) = load_first(&entries, shuffled_others(entries.len(), Some(0)))
+                .expect("another image");
+            assert_eq!(index, 2);
+        }
     }
 
     #[test]

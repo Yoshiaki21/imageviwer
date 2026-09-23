@@ -47,6 +47,7 @@
   `image::Frame` が `gpui::RenderImage` にそのまま渡せる。
 - 設定: `toml 0.9` + `serde`（読み込みのみ。書き出しは手書き。理由は §4）
 - ログ: `log 0.4` + 自前のファイルロガー + `chrono`（タイムスタンプ）
+- 乱数: `fastrand 2`（R キー・右クリックのランダム表示用。gpui の依存に既に含まれていて追加のビルドが要らないため）
 - ゴミ箱: `trash 5`（Windows のごみ箱と freedesktop の Trash を同じ API で扱えるため。
   Windows では gpui が初期化済みの STA に合わせる既定の `coinit_apartmentthreaded` のまま使う）
 - マウスの OS 依存値（ダブルクリック間隔・ホイール1ノッチの行数）: Windows は `windows-sys` の
@@ -63,8 +64,8 @@
 | 起動処理・引数処理・ウィンドウ生成・起動時の表示内容の決定 | `src/main.rs` |
 | キー操作の追加／画面の描画／画像の切り替えロジック | `src/viewer.rs` |
 | キーバインドの変更 | `src/viewer.rs` の `bind_keys()` |
-| ←→ のループ（折り返し）・Delete でゴミ箱へ移動 | `src/viewer.rs` の `step_image()` / `on_delete_image()`（巡回順は `wrapping_indices()`） |
-| マウス操作（4分割クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_scroll_wheel()` |
+| ←→ のループ（折り返し）・Delete でゴミ箱へ移動・R（と 2・3 の右クリック）でランダム表示 | `src/viewer.rs` の `step_image()` / `on_delete_image()` / `show_random_image()`（巡回順は `wrapping_indices()`、ランダム順は `shuffled_others()`） |
+| マウス操作（4分割クリック・右クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_right_mouse_down()` / `on_scroll_wheel()` |
 | クリック位置→エリアの判定、ダブルクリック間隔、ホイールのノッチ換算 | `src/pointer.rs` |
 | フォルダ名・ファイル名の表示／「前（次）のフォルダはありません」等のお知らせ | `src/viewer.rs` の `show_caption()` / `display_caption()` / `render_caption()`（種類は `CaptionText`）、表示時間は `config.rs` の `OverlayConfig` |
 | 対応画像フォーマットの追加 | `src/media/mod.rs` の `ImageFormat` に列挙子を追加し、`src/media/<形式>.rs` を作る |
@@ -98,6 +99,7 @@
 - **テストモジュールで `use super::*` を書かない（`src/viewer.rs` など gpui を使うファイル）。**
   `gpui_kit::*` に gpui 独自の `test` マクロが含まれており、Rust の `#[test]` を隠して
   「recursion limit reached while expanding `#[test]`」になる。必要な項目だけ個別に import する。
+- **右クリックは待たずに即実行する。** 右ボタンにはダブルクリックの動作が無いため。
 - **シングルクリックはダブルクリック間隔だけ遅らせて実行する。** ダブルクリックでフルスクリーンにしたとき
   画像まで移動しないため。待機中のクリックは `pending_click` の `Task` で持ち、drop でキャンセルする。
 - **タイマーは gpui の `Task` をフィールドに保持し、上書き（drop）でキャンセルする。** 表示の消去も同じ方式。
@@ -142,6 +144,7 @@ cargo run -- /path/to/image.png
 - 2026-09-23: ←→ のループと Delete（ゴミ箱へ移動）を追加。
 - 2026-09-23: マウス操作（4分割クリック・ダブルクリック・ホイール）とフォルダ名・ファイル名の一時表示を追加。
 - 2026-09-23: 兄弟フォルダが無いときのお知らせ表示を追加。以上の追加機能を Windows 版の実機で確認。
+- 2026-09-23: R キーと右クリック（2・3）でのランダム表示を追加。KDE で確認。
 
 ---
 

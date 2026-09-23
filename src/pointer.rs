@@ -16,9 +16,9 @@ use crate::library::Step;
 pub enum ClickArea {
     /// 1: previous sibling folder (↑).
     TopLeft,
-    /// 2: previous image (←).
+    /// 2: previous image (←); a right click shows a random image (R).
     BottomLeft,
-    /// 3: next image (→).
+    /// 3: next image (→); a right click shows a random image (R).
     BottomRight,
     /// 4: next sibling folder (↓).
     TopRight,

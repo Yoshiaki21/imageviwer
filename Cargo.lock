@@ -3331,6 +3331,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "chrono",
+ "fastrand",
  "gpui-kit",
  "image",
  "log",
