@@ -74,13 +74,23 @@ enum Content {
     Message(SharedString),
 }
 
-/// The folder / file caption shown at the bottom after the image changes.
+/// The caption shown at the bottom for a while: where the new image is, or
+/// why nothing changed.
 struct Caption {
-    folder: SharedString,
-    file: SharedString,
+    text: CaptionText,
     /// Distinguishes each showing, so a new one restarts the fade animation.
     showing: usize,
     fading: bool,
+}
+
+enum CaptionText {
+    /// After the image changes: the folder, and the file within it.
+    Location {
+        folder: SharedString,
+        file: SharedString,
+    },
+    /// A one-line notice, e.g. that there is no further sibling folder.
+    Notice(SharedString),
 }
 
 pub struct ViewerView {
@@ -408,6 +418,11 @@ impl ViewerView {
         }
 
         log::debug!("no further folder with images in this direction");
+        let notice = match step {
+            Step::Backward => "前のフォルダはありません",
+            Step::Forward => "次のフォルダはありません",
+        };
+        self.display_caption(CaptionText::Notice(notice.into()), cx);
     }
 
     /// Swaps in new content, releasing the texture the old image held.
@@ -422,22 +437,34 @@ impl ViewerView {
 
     /// Shows the caption for the current image, restarting its timer.
     fn show_caption(&mut self, cx: &mut Context<Self>) {
-        self.caption = None;
-        self.caption_timer = None;
         let Content::Gallery(gallery) = &self.content else {
+            self.caption = None;
+            self.caption_timer = None;
             return;
         };
+        let text = CaptionText::Location {
+            folder: gallery.folder.display().to_string().into(),
+            file: caption_file_line(gallery).into(),
+        };
+        self.display_caption(text, cx);
+    }
+
+    /// Puts `text` up for `[overlay] duration_ms`, replacing whatever caption
+    /// is showing and restarting the timer.
+    fn display_caption(&mut self, text: CaptionText, cx: &mut Context<Self>) {
+        self.caption = None;
+        self.caption_timer = None;
         if self.caption_duration.is_zero() {
             return;
         }
 
         self.caption_showings += 1;
         self.caption = Some(Caption {
-            folder: gallery.folder.display().to_string().into(),
-            file: caption_file_line(gallery).into(),
+            text,
             showing: self.caption_showings,
             fading: false,
         });
+        cx.notify();
 
         let fade = CAPTION_FADE.min(self.caption_duration);
         let hold = self.caption_duration - fade;
@@ -526,10 +553,14 @@ impl ViewerView {
             .text_sm()
             .flex()
             .flex_col()
-            .items_center()
-            // Long paths keep their end: the folder being browsed.
-            .child(line().text_ellipsis_start().child(caption.folder.clone()))
-            .child(line().text_ellipsis_middle().child(caption.file.clone()));
+            .items_center();
+        let panel = match &caption.text {
+            CaptionText::Location { folder, file } => panel
+                // Long paths keep their end: the folder being browsed.
+                .child(line().text_ellipsis_start().child(folder.clone()))
+                .child(line().text_ellipsis_middle().child(file.clone())),
+            CaptionText::Notice(text) => panel.child(line().child(text.clone())),
+        };
 
         let panel = if caption.fading {
             let fade = CAPTION_FADE.min(self.caption_duration);

@@ -66,7 +66,7 @@
 | ←→ のループ（折り返し）・Delete でゴミ箱へ移動 | `src/viewer.rs` の `step_image()` / `on_delete_image()`（巡回順は `wrapping_indices()`） |
 | マウス操作（4分割クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_scroll_wheel()` |
 | クリック位置→エリアの判定、ダブルクリック間隔、ホイールのノッチ換算 | `src/pointer.rs` |
-| フォルダ名・ファイル名の表示（内容・見た目・表示時間の制御） | `src/viewer.rs` の `show_caption()` / `render_caption()`、表示時間は `config.rs` の `OverlayConfig` |
+| フォルダ名・ファイル名の表示／「前（次）のフォルダはありません」等のお知らせ | `src/viewer.rs` の `show_caption()` / `display_caption()` / `render_caption()`（種類は `CaptionText`）、表示時間は `config.rs` の `OverlayConfig` |
 | 対応画像フォーマットの追加 | `src/media/mod.rs` の `ImageFormat` に列挙子を追加し、`src/media/<形式>.rs` を作る |
 | 画像のデコード処理そのもの | `src/media/png.rs` / `src/media/jpeg.rs`（共通部は `mod.rs` の `decode_as`） |
 | フォルダ走査・次/前の画像・兄弟フォルダ探索 | `src/library.rs` |
