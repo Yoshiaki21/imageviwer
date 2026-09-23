@@ -1,0 +1,35 @@
+[package]
+name = "imageviewer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Minimal fullscreen-capable image viewer for Windows 11 and Linux (KDE)"
+license = "MIT"
+
+[[bin]]
+name = "imageviewer"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+anyhow = "1"
+log = "0.4"
+smallvec = "1"
+async-channel = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = 3

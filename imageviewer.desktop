@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+#アプリ名
+Name=imageviwer
+#実行ファイルパス
+Exec=/home/lucifar/GitHub/imageviwer/target/release/imageviewer %f
+#Icon=/path/to/icon.png
+MimeType=image/png;
+Terminal=false
+Categories=Graphics;
+
+
