@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.90"
 description = "Minimal fullscreen-capable image viewer for Windows 11 and Linux (KDE)"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "imageviewer"
@@ -34,3 +35,6 @@ windows-sys = { version = "0.60", features = [
 
 [profile.release]
 opt-level = 3
+
+[build-dependencies]
+winresource = "0.1"
