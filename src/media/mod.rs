@@ -119,6 +119,16 @@ pub fn decode(path: &Path) -> Result<DecodedImage> {
         .with_context(|| format!("decoding {}", path.display()))
 }
 
+/// Whether a [`decode`] error means the file is not there at all (deleted,
+/// moved or renamed), as opposed to being there but unreadable or corrupt.
+pub fn is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// Whether `path` has an extension the viewer can display.
 pub fn is_supported(path: &Path) -> bool {
     ImageFormat::from_path(path).is_some()
@@ -209,7 +219,18 @@ mod tests {
 
     #[test]
     fn a_missing_file_fails() {
-        assert!(decode(Path::new("/nonexistent/none.png")).is_err());
+        let error = decode(Path::new("/nonexistent/none.png"))
+            .err()
+            .expect("no such file");
+        assert!(is_missing(&error));
+    }
+
+    #[test]
+    fn a_corrupt_file_is_not_reported_as_missing() {
+        let tree = TempTree::new("corrupt-not-missing");
+        let path = tree.write("broken.jpg", b"not really a jpeg");
+        let error = decode(&path).err().expect("corrupt");
+        assert!(!is_missing(&error));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Reading the folders the viewer navigates (spec §4).
 //!
-//! Every listing is taken fresh from disk, because files can be deleted or
-//! moved while the viewer is open.
+//! Every call here reads the disk afresh; deciding when a listing is stale
+//! enough to re-read is up to the viewer.
 
+use std::fs::DirEntry;
 use std::path::{Path, PathBuf};
 
 use crate::media;
@@ -24,8 +25,8 @@ pub fn list_images(folder: &Path) -> Vec<PathBuf> {
 
     let mut images: Vec<PathBuf> = entries
         .flatten()
+        .filter(is_image)
         .map(|entry| entry.path())
-        .filter(|path| media::is_supported(path) && path.is_file())
         .collect();
     images.sort_by(|a, b| natural_cmp_paths(a, b));
     images
@@ -37,9 +38,32 @@ pub fn has_images(folder: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| media::is_supported(&entry.path()) && entry.path().is_file())
+    entries.flatten().any(|entry| is_image(&entry))
+}
+
+/// Whether a listed entry is a file with a displayable extension.
+///
+/// The type comes from `DirEntry::file_type`, which the listing already
+/// carries on Windows and on most Linux file systems. `Path::is_file` would
+/// ask the OS once per file instead, and in a folder of thousands of images
+/// that alone took hundreds of milliseconds per listing.
+fn is_image(entry: &DirEntry) -> bool {
+    media::is_supported(Path::new(&entry.file_name()))
+        && match entry.file_type() {
+            // A symlink's own type says nothing about its target.
+            Ok(kind) if kind.is_symlink() => entry.path().is_file(),
+            Ok(kind) => kind.is_file(),
+            Err(_) => false,
+        }
+}
+
+/// Whether a listed entry is a folder, following symlinks. See [`is_image`].
+fn is_folder(entry: &DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
+        Ok(kind) => kind.is_dir(),
+        Err(_) => false,
+    }
 }
 
 /// Folders sharing a parent with `folder`, in natural order, including
@@ -54,8 +78,8 @@ pub fn sibling_folders(folder: &Path) -> Vec<PathBuf> {
 
     let mut folders: Vec<PathBuf> = entries
         .flatten()
+        .filter(is_folder)
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
         .collect();
     folders.sort_by(|a, b| natural_cmp_paths(a, b));
     folders
@@ -106,6 +130,18 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["img1.png", "img2.jpg", "img10.jpg"]);
+    }
+
+    #[test]
+    fn a_folder_named_like_an_image_is_not_an_image() {
+        let tree = TempTree::new("folder-png");
+        let folder = tree.dir("pics");
+        tree.dir("pics/album.png");
+        assert!(list_images(&folder).is_empty());
+        assert!(!has_images(&folder));
+
+        tree.image("pics/1.png", 4, 4, [0, 0, 0]);
+        assert_eq!(list_images(&folder).len(), 1);
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub overlay: OverlayConfig,
     #[serde(default)]
+    pub prefetch: PrefetchConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -67,6 +69,49 @@ impl OverlayConfig {
 
 fn default_overlay_duration_ms() -> u64 {
     5000
+}
+
+/// Decoding the images around the one on screen ahead of time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefetchConfig {
+    /// Images decoded ahead in the direction of travel.
+    #[serde(default = "default_prefetch_ahead")]
+    pub ahead: usize,
+    /// Images kept decoded the other way, for going back.
+    #[serde(default = "default_prefetch_behind")]
+    pub behind: usize,
+    /// Upper limit on the memory the decoded images may take, in megabytes.
+    #[serde(default = "default_prefetch_memory_mb")]
+    pub memory_mb: usize,
+}
+
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        Self {
+            ahead: default_prefetch_ahead(),
+            behind: default_prefetch_behind(),
+            memory_mb: default_prefetch_memory_mb(),
+        }
+    }
+}
+
+impl PrefetchConfig {
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+fn default_prefetch_ahead() -> usize {
+    4
+}
+
+fn default_prefetch_behind() -> usize {
+    2
+}
+
+fn default_prefetch_memory_mb() -> usize {
+    1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +217,24 @@ impl Config {
         out.push_str(&format!("duration_ms = {}\n", self.overlay.duration_ms));
         out.push('\n');
 
+        out.push_str("[prefetch]\n");
+        out.push_str(
+            "# 表示中の画像の前後を別スレッドで先にデコードしておき、切り替えを速くする。\n",
+        );
+        out.push_str(&format!(
+            "ahead = {}          # 進行方向に先読みする枚数\n",
+            self.prefetch.ahead
+        ));
+        out.push_str(&format!(
+            "behind = {}         # 逆方向（戻る側）にデコード済みで残しておく枚数\n",
+            self.prefetch.behind
+        ));
+        out.push_str(&format!(
+            "memory_mb = {}   # 先読みに使うメモリの上限（MB）。超えたら遠い画像から捨てる\n",
+            self.prefetch.memory_mb
+        ));
+        out.push('\n');
+
         out.push_str("[logging]\n");
         out.push_str(&format!(
             "enabled = {}          # ログ出力する/しない（未指定時のデフォルト: true）\n",
@@ -263,6 +326,7 @@ mod tests {
                 index: 5,
             }),
             overlay: OverlayConfig { duration_ms: 1500 },
+            prefetch: PrefetchConfig::default(),
             logging: LoggingConfig::default(),
         };
 
@@ -273,6 +337,28 @@ mod tests {
         assert_eq!(last.folder, PathBuf::from(r"C:\Users\yoshiaki\Pictures\sample"));
         assert_eq!(last.index, 5);
         assert_eq!(parsed.overlay.duration_ms, 1500);
+    }
+
+    #[test]
+    fn prefetch_settings_default_and_survive_a_roundtrip() {
+        let defaults = roundtrip(&Config::default()).prefetch;
+        assert_eq!(
+            (defaults.ahead, defaults.behind, defaults.memory_mb),
+            (4, 2, 1024)
+        );
+
+        let mut config = Config::default();
+        config.prefetch.ahead = 8;
+        config.prefetch.behind = 3;
+        config.prefetch.memory_mb = 2048;
+        let parsed = roundtrip(&config).prefetch;
+        assert_eq!((parsed.ahead, parsed.behind, parsed.memory_mb), (8, 3, 2048));
+    }
+
+    #[test]
+    fn a_file_without_a_prefetch_section_uses_the_defaults() {
+        let parsed: Config = toml::from_str("[overlay]\nduration_ms = 100\n").expect("parses");
+        assert_eq!(parsed.prefetch.ahead, 4);
     }
 
     #[test]

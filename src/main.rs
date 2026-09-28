@@ -16,6 +16,7 @@ mod logging;
 mod media;
 mod natural_sort;
 mod pointer;
+mod prefetch;
 mod report;
 #[cfg(test)]
 mod test_support;
@@ -71,6 +72,7 @@ fn main() {
 
 fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: Config) {
     let overlay_duration = config.overlay.duration();
+    let prefetch = config.prefetch.clone();
     let startup = decide_startup(requested_path, config);
 
     gpui_kit::application()
@@ -82,7 +84,7 @@ fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: C
             let options = window_options(cx);
             let mut viewer: Option<Entity<ViewerView>> = None;
             let opened = cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| ViewerView::new(startup, overlay_duration, window, cx));
+                let view = cx.new(|cx| ViewerView::new(startup, overlay_duration, &prefetch, window, cx));
                 viewer = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             });

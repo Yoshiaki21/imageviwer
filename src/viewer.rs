@@ -3,17 +3,18 @@
 //! for a few seconds after each change.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::*;
 
-use crate::config::{Config, LastOpened, WindowConfig};
+use crate::config::{Config, LastOpened, PrefetchConfig, WindowConfig};
 use crate::library::{self, Step};
-use crate::media;
 use crate::natural_sort::natural_cmp_paths;
 use crate::pointer::{self, ClickArea, WheelNotches};
+use crate::prefetch::{self, Decoded, FileStamp, Lookup, Outcome, Prefetcher};
 use crate::report;
 
 /// How long the caption takes to fade out at the end of its display time.
@@ -32,6 +33,7 @@ gpui_kit::actions!(
         ToggleFullscreen,
         DeleteImage,
         RandomImage,
+        RefreshListing,
         Quit,
     ]
 );
@@ -46,6 +48,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", ToggleFullscreen, Some(KEY_CONTEXT)),
         KeyBinding::new("delete", DeleteImage, Some(KEY_CONTEXT)),
         KeyBinding::new("r", RandomImage, Some(KEY_CONTEXT)),
+        KeyBinding::new("f5", RefreshListing, Some(KEY_CONTEXT)),
         // Not in the spec, but a fullscreen window has no close button.
         KeyBinding::new("ctrl-q", Quit, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", Quit, Some(KEY_CONTEXT)),
@@ -65,10 +68,29 @@ pub enum Startup {
 /// The folder currently being browsed and the image on screen.
 struct Gallery {
     folder: PathBuf,
-    /// Natural-ordered listing, re-read whenever the folder changes.
+    /// Natural-ordered listing, read on entering the folder and kept while
+    /// moving within it. It is re-read when a file in it turns out to be gone
+    /// and on F5; files added meanwhile only show up after that.
     entries: Vec<PathBuf>,
+    /// The cursor: the image last moved to. Ahead of `shown` while a move is
+    /// still waiting for its decode.
     index: usize,
+    /// The image on screen, and the file it came from.
     image: Arc<RenderImage>,
+    shown: PathBuf,
+}
+
+impl Gallery {
+    fn new(folder: PathBuf, entries: Vec<PathBuf>, index: usize, image: Arc<RenderImage>) -> Self {
+        let shown = entries[index].clone();
+        Self {
+            folder,
+            entries,
+            index,
+            image,
+            shown,
+        }
+    }
 }
 
 enum Content {
@@ -114,13 +136,25 @@ pub struct ViewerView {
     /// click. Dropping the task cancels the click.
     pending_click: Option<(ClickArea, Task<()>)>,
     wheel: WheelNotches,
+    /// Decoded images around the cursor, decoded on background threads.
+    prefetch: Prefetcher,
+    prefetch_ahead: usize,
+    prefetch_behind: usize,
+    /// The way the last move went, which is the way prefetching looks ahead.
+    direction: Step,
+    /// A move waiting for the decode of the image it is heading for.
+    seek: Option<Seek>,
+    /// Images taken off screen that nothing keeps any more; their textures
+    /// are freed by the next `release_textures`.
+    orphaned: Vec<Arc<RenderImage>>,
 }
 
 impl ViewerView {
     pub fn new(
         startup: Startup,
         caption_duration: Duration,
-        _window: &mut Window,
+        prefetch: &PrefetchConfig,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let content = match startup {
@@ -139,8 +173,14 @@ impl ViewerView {
             caption_showings: 0,
             pending_click: None,
             wheel: WheelNotches::default(),
+            prefetch: Prefetcher::new(prefetch.memory_bytes(), prefetch::default_parallelism()),
+            prefetch_ahead: prefetch.ahead,
+            prefetch_behind: prefetch.behind,
+            direction: Step::Forward,
+            seek: None,
+            orphaned: Vec::new(),
         };
-        view.show_caption(cx);
+        view.content_changed(window, cx);
         view
     }
 
@@ -189,9 +229,15 @@ impl ViewerView {
         });
 
         if let Content::Gallery(gallery) = &self.content {
+            // The image the user last saw, not a move still waiting for it.
+            let index = gallery
+                .entries
+                .iter()
+                .position(|entry| *entry == gallery.shown)
+                .unwrap_or(gallery.index);
             config.last_opened = Some(LastOpened {
                 folder: gallery.folder.clone(),
-                index: gallery.index,
+                index,
             });
         }
 
@@ -237,10 +283,15 @@ impl ViewerView {
     /// Moves the image on screen to the OS trash and shows the one that
     /// followed it, wrapping to the first image like → does.
     fn on_delete_image(&mut self, _: &DeleteImage, window: &mut Window, cx: &mut Context<Self>) {
-        let Content::Gallery(gallery) = &self.content else {
+        let Content::Gallery(gallery) = &mut self.content else {
             return;
         };
-        let deleted = gallery.entries[gallery.index].clone();
+        // The image the user is looking at, even if a move away from it is
+        // still waiting for its decode.
+        let deleted = gallery.shown.clone();
+        let Some(index) = gallery.entries.iter().position(|entry| *entry == deleted) else {
+            return;
+        };
 
         if let Err(error) = trash::delete(&deleted) {
             report::error(&format!(
@@ -251,29 +302,54 @@ impl ViewerView {
         }
         log::debug!("moved {} to the trash", deleted.display());
 
-        let folder = gallery.folder.clone();
-        let entries = library::list_images(&folder);
-        // The first file sorting after the deleted one is its successor.
-        let successor = entries
-            .partition_point(|entry| natural_cmp_paths(entry, &deleted) != Ordering::Greater);
-        let start = if successor < entries.len() {
-            successor
-        } else {
-            0
+        // The listing held is still right apart from the deleted file, so
+        // take that out rather than re-reading the folder.
+        gallery.entries.remove(index);
+        let order = candidates(Pick::Successor, &gallery.entries, &deleted, index);
+        self.prefetch.forget(&deleted);
+        self.direction = Step::Forward;
+        self.seek = Some(Seek {
+            pick: Pick::Successor,
+            anchor: deleted,
+            anchor_index: index,
+            order,
+            reread: false,
+        });
+        self.resolve(window, cx);
+    }
+
+    /// F5: re-reads the folder, for files added since it was entered. Every
+    /// decode is dropped, so the image on screen is decoded again too in case
+    /// it was overwritten.
+    fn on_refresh_listing(
+        &mut self,
+        _: &RefreshListing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Content::Gallery(gallery) = &mut self.content else {
+            return;
         };
-        let content = match load_first(
-            &entries,
-            wrapping_indices(entries.len(), start, Step::Forward),
-        ) {
-            Some((index, image)) => Content::Gallery(Gallery {
-                folder,
-                entries,
-                index,
-                image,
-            }),
-            None => Content::Message(message_for_empty_folder(&folder)),
-        };
-        self.replace_content(content, window, cx);
+        log::debug!("refreshing {}", gallery.folder.display());
+
+        // If the image on screen is gone, its old index is where to look.
+        let anchor = gallery.shown.clone();
+        let anchor_index = gallery
+            .entries
+            .iter()
+            .position(|entry| *entry == anchor)
+            .unwrap_or(gallery.index);
+        gallery.entries = library::list_images(&gallery.folder);
+        let order = candidates(Pick::Nearest, &gallery.entries, &anchor, anchor_index);
+        self.prefetch.clear();
+        self.seek = Some(Seek {
+            pick: Pick::Nearest,
+            anchor,
+            anchor_index,
+            order,
+            reread: true,
+        });
+        self.resolve(window, cx);
     }
 
     fn on_random_image(&mut self, _: &RandomImage, window: &mut Window, cx: &mut Context<Self>) {
@@ -281,33 +357,10 @@ impl ViewerView {
     }
 
     /// Jumps to a randomly chosen other image in the current folder. Files
-    /// that vanished or fail to decode are skipped by drawing again (spec §8).
+    /// that fail to decode are skipped by drawing again (spec §8).
     fn show_random_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("random image");
-        let Content::Gallery(gallery) = &self.content else {
-            return;
-        };
-
-        // Re-read the folder so deletions made elsewhere are noticed.
-        let entries = library::list_images(&gallery.folder);
-        let current = position_of(&entries, &gallery.entries, gallery.index);
-        let Some((index, image)) = load_first(&entries, shuffled_others(entries.len(), current))
-        else {
-            log::debug!("no other image in this folder");
-            return;
-        };
-
-        let folder = gallery.folder.clone();
-        self.replace_content(
-            Content::Gallery(Gallery {
-                folder,
-                entries,
-                index,
-                image,
-            }),
-            window,
-            cx,
-        );
+        self.start_seek(Pick::Random, window, cx);
     }
 
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
@@ -401,42 +454,197 @@ impl ViewerView {
     /// skipped (spec §8).
     fn step_image(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("step image {step:?}");
+        self.direction = step;
+        self.start_seek(Pick::Step(step), window, cx);
+    }
+
+    /// Starts a move within the current folder, measured from the cursor: the
+    /// image last moved to, which is ahead of the one on screen while its
+    /// decode is still running. A move made while another is waiting replaces
+    /// it, so holding a key down always heads for the latest target.
+    fn start_seek(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<Self>) {
         let Content::Gallery(gallery) = &self.content else {
             return;
         };
+        let anchor = gallery.entries[gallery.index].clone();
+        let order = candidates(pick, &gallery.entries, &anchor, gallery.index);
+        self.seek = Some(Seek {
+            pick,
+            anchor,
+            anchor_index: gallery.index,
+            order,
+            reread: false,
+        });
+        self.resolve(window, cx);
+    }
 
-        // Re-read the folder so deletions made elsewhere are noticed.
-        let entries = library::list_images(&gallery.folder);
-        let Some(current) = position_of(&entries, &gallery.entries, gallery.index) else {
-            // The current file is gone; land on the nearest survivor instead.
-            let folder = gallery.folder.clone();
-            let index = gallery.index;
-            let content = Self::open_folder_at(&folder, index);
-            self.replace_content(content, window, cx);
+    /// Works through the pending move's candidates: shows the first one that
+    /// is decoded, skips corrupt ones, and waits for a decode when it reaches
+    /// one that is not ready yet ([`Self::on_decoded`] resumes it).
+    ///
+    /// The listing read on entering the folder is reused throughout. A listed
+    /// file that no longer exists means the folder has changed: the listing is
+    /// then re-read once and the candidates worked out again from it, which
+    /// looks the same to the user as re-reading on every move.
+    fn resolve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(mut seek) = self.seek.take() {
+            while let Content::Gallery(gallery) = &mut self.content {
+                let Some(&index) = seek.order.front() else {
+                    self.settle_without_moving(window, cx);
+                    break;
+                };
+                // The cursor follows the candidate, so the images around it
+                // are the ones decoded next.
+                gallery.index = index;
+                let path = gallery.entries[index].clone();
+                self.update_wanted();
+
+                match self.prefetch.lookup(&path) {
+                    Lookup::Image(image) => {
+                        self.show(image, cx);
+                        break;
+                    }
+                    Lookup::Unusable => {
+                        seek.order.pop_front();
+                    }
+                    Lookup::Missing if !seek.reread => {
+                        log::debug!("{} is gone; re-reading the folder", path.display());
+                        let Content::Gallery(gallery) = &mut self.content else {
+                            break;
+                        };
+                        gallery.entries = library::list_images(&gallery.folder);
+                        seek.order = candidates(
+                            seek.pick,
+                            &gallery.entries,
+                            &seek.anchor,
+                            seek.anchor_index,
+                        );
+                        seek.reread = true;
+                    }
+                    Lookup::Missing => {
+                        seek.order.pop_front();
+                    }
+                    Lookup::Absent => {
+                        self.seek = Some(seek);
+                        break;
+                    }
+                }
+            }
+        }
+        self.release_textures(window);
+        self.schedule_decodes(window, cx);
+    }
+
+    /// The pending move found nothing to show: the image on screen stays if it
+    /// is still in the folder, otherwise the folder is as good as empty.
+    fn settle_without_moving(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Content::Gallery(gallery) = &mut self.content else {
             return;
         };
+        match gallery
+            .entries
+            .iter()
+            .position(|entry| *entry == gallery.shown)
+        {
+            Some(index) => {
+                log::debug!("no other image in this folder");
+                gallery.index = index;
+                self.update_wanted();
+            }
+            None => {
+                let message = message_for_empty_folder(&gallery.folder);
+                self.replace_content(Content::Message(message), window, cx);
+            }
+        }
+    }
 
-        // Every other image once, starting next to the current one; the
-        // current image itself is the last index and is left out.
-        let others = wrapping_indices(entries.len(), current, step)
-            .skip(1)
-            .take(entries.len() - 1);
-        let Some((index, image)) = load_first(&entries, others) else {
-            log::debug!("no other image in this folder");
+    /// Puts the image at the cursor on screen, with its caption.
+    fn show(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
+        let Content::Gallery(gallery) = &mut self.content else {
             return;
         };
+        gallery.shown = gallery.entries[gallery.index].clone();
+        log::debug!("showing {}", gallery.shown.display());
+        let previous = std::mem::replace(&mut gallery.image, image);
+        // The old texture stays in the atlas while the image is still kept
+        // decoded, so that coming back to it is instant; otherwise it is freed
+        // with the next `release_textures`.
+        if !self.prefetch.holds(&previous) && !Arc::ptr_eq(&previous, &gallery.image) {
+            self.orphaned.push(previous);
+        }
+        self.show_caption(cx);
+        cx.notify();
+    }
 
-        let folder = gallery.folder.clone();
-        self.replace_content(
-            Content::Gallery(Gallery {
-                folder,
-                entries,
-                index,
-                image,
-            }),
-            window,
-            cx,
-        );
+    /// Tells the prefetcher which files to keep decoded: the cursor's
+    /// neighbourhood in the current folder, or nothing.
+    fn update_wanted(&mut self) {
+        let wanted = match &self.content {
+            Content::Gallery(gallery) => prefetch::window_indices(
+                gallery.entries.len(),
+                gallery.index,
+                self.direction,
+                self.prefetch_ahead,
+                self.prefetch_behind,
+            )
+            .into_iter()
+            .map(|index| gallery.entries[index].clone())
+            .collect(),
+            Content::Message(_) => Vec::new(),
+        };
+        self.prefetch.set_wanted(wanted);
+    }
+
+    /// Starts background decodes while there are free slots and wanted files
+    /// not decoded yet.
+    fn schedule_decodes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(path) = self.prefetch.next_to_decode() {
+            let job = cx.background_executor().spawn({
+                let path = path.clone();
+                async move { prefetch::decode(&path) }
+            });
+            // Never cancelled: a decode that is no longer wanted when it lands
+            // is simply dropped by the prefetcher, and the slot it held stays
+            // accounted for until then.
+            cx.spawn_in(window, async move |this, cx| {
+                let decoded = job.await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view.on_decoded(path, decoded, window, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn on_decoded(
+        &mut self,
+        path: PathBuf,
+        decoded: Decoded,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prefetch.finish(path, decoded);
+        // A pending move may have been waiting for exactly this decode.
+        self.resolve(window, cx);
+    }
+
+    /// Frees the GPU textures of images that are neither on screen nor kept
+    /// decoded any more.
+    fn release_textures(&mut self, window: &mut Window) {
+        let shown = match &self.content {
+            Content::Gallery(gallery) => Some(gallery.image.clone()),
+            Content::Message(_) => None,
+        };
+        let released = self.prefetch.take_released();
+        for image in self.orphaned.drain(..).chain(released) {
+            if shown
+                .as_ref()
+                .is_some_and(|shown| Arc::ptr_eq(shown, &image))
+            {
+                continue;
+            }
+            let _ = window.drop_image(image);
+        }
     }
 
     /// Moves to the previous/next sibling folder that holds images and shows
@@ -452,12 +660,7 @@ impl ViewerView {
             let entries = library::list_images(&folder);
             if let Some((index, image)) = load_scanning(&entries, 0, Step::Forward) {
                 self.replace_content(
-                    Content::Gallery(Gallery {
-                        folder,
-                        entries,
-                        index,
-                        image,
-                    }),
+                    Content::Gallery(Gallery::new(folder, entries, index, image)),
                     window,
                     cx,
                 );
@@ -477,12 +680,36 @@ impl ViewerView {
         self.display_caption(CaptionText::Notice(notice.into()), cx);
     }
 
-    /// Swaps in new content, releasing the texture the old image held.
+    /// Swaps in new content decoded on the spot (startup, ↑ / ↓, a launch
+    /// request), dropping any pending move, and starts prefetching around it.
     fn replace_content(&mut self, content: Content, window: &mut Window, cx: &mut Context<Self>) {
+        self.seek = None;
+        self.direction = Step::Forward;
         if let Content::Gallery(previous) = &self.content {
-            let _ = window.drop_image(previous.image.clone());
+            if !self.prefetch.holds(&previous.image) {
+                self.orphaned.push(previous.image.clone());
+            }
         }
         self.content = content;
+        self.content_changed(window, cx);
+    }
+
+    /// After the content was set without going through the prefetcher: lets
+    /// it know about the image on screen and what to decode around it.
+    fn content_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_wanted();
+        if let Content::Gallery(gallery) = &self.content {
+            // Kept, so that coming back to it needs no second decode.
+            self.prefetch.insert(
+                gallery.shown.clone(),
+                Decoded {
+                    outcome: Outcome::Image(gallery.image.clone()),
+                    stamp: FileStamp::read(&gallery.shown).ok(),
+                },
+            );
+        }
+        self.release_textures(window);
+        self.schedule_decodes(window, cx);
         self.show_caption(cx);
         cx.notify();
     }
@@ -551,12 +778,7 @@ impl ViewerView {
         let target = entries.iter().position(|entry| entry == path).unwrap_or(0);
 
         match load_nearest(&entries, target) {
-            Some((index, image)) => Content::Gallery(Gallery {
-                folder,
-                entries,
-                index,
-                image,
-            }),
+            Some((index, image)) => Content::Gallery(Gallery::new(folder, entries, index, image)),
             None => Content::Message(message_for_missing(path)),
         }
     }
@@ -564,16 +786,7 @@ impl ViewerView {
     /// Opens `folder` at the saved index, or the nearest usable image to it
     /// (spec §8.3).
     fn open_folder_at(folder: &Path, index: usize) -> Content {
-        let entries = library::list_images(folder);
-        match load_nearest(&entries, index) {
-            Some((index, image)) => Content::Gallery(Gallery {
-                folder: folder.to_path_buf(),
-                entries,
-                index,
-                image,
-            }),
-            None => Content::Message(message_for_empty_folder(folder)),
-        }
+        gallery_near(folder.to_path_buf(), library::list_images(folder), index)
     }
 
     /// The image surface. Zoom would be added here: the element already owns
@@ -655,6 +868,7 @@ impl Render for ViewerView {
             .on_action(cx.listener(Self::on_toggle_fullscreen))
             .on_action(cx.listener(Self::on_delete_image))
             .on_action(cx.listener(Self::on_random_image))
+            .on_action(cx.listener(Self::on_refresh_listing))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -681,11 +895,67 @@ impl Render for ViewerView {
     }
 }
 
-/// Finds where the previously displayed file ended up in a freshly read
-/// listing, so navigation stays anchored across changes on disk.
-fn position_of(entries: &[PathBuf], previous: &[PathBuf], index: usize) -> Option<usize> {
-    let current = previous.get(index)?;
-    entries.iter().position(|entry| entry == current)
+/// A move within the folder that is still looking for an image to show.
+struct Seek {
+    pick: Pick,
+    /// The file the move is measured from (for Delete, the deleted file), so
+    /// the candidates can be worked out again after re-reading the listing.
+    anchor: PathBuf,
+    /// Where `anchor` was, for when it is no longer in the listing.
+    anchor_index: usize,
+    /// Listing indices still to try, in order.
+    order: VecDeque<usize>,
+    /// Whether the listing was already re-read for this move. It is re-read
+    /// at most once; after that a missing file is simply skipped.
+    reread: bool,
+}
+
+/// Which images a move tries, in what order.
+#[derive(Clone, Copy, Debug)]
+enum Pick {
+    /// ← / →: every other image once, wrapping (spec §4).
+    Step(Step),
+    /// R: every other image once, in random order.
+    Random,
+    /// After Delete: the image that followed the deleted one, wrapping.
+    Successor,
+    /// F5: the image on screen again, else the one nearest to it.
+    Nearest,
+}
+
+/// The listing indices a move tries, in order.
+///
+/// Measured from `anchor` wherever it now sits in `entries`. If it is no
+/// longer listed, the move lands on the image nearest to where it was,
+/// preferring the earlier one (spec §8.3).
+fn candidates(
+    pick: Pick,
+    entries: &[PathBuf],
+    anchor: &Path,
+    anchor_index: usize,
+) -> VecDeque<usize> {
+    let len = entries.len();
+    if len == 0 {
+        return VecDeque::new();
+    }
+    if let Pick::Successor = pick {
+        // The first file sorting after the deleted one is its successor.
+        let successor =
+            entries.partition_point(|entry| natural_cmp_paths(entry, anchor) != Ordering::Greater);
+        let start = if successor < len { successor } else { 0 };
+        return wrapping_indices(len, start, Step::Forward).collect();
+    }
+
+    let Some(position) = entries.iter().position(|entry| entry == anchor) else {
+        return nearest_indices(len, anchor_index).collect();
+    };
+    match pick {
+        // The anchor itself comes last round and is left out.
+        Pick::Step(step) => wrapping_indices(len, position, step).skip(1).collect(),
+        Pick::Random => shuffled_others(len, position).into(),
+        Pick::Nearest => nearest_indices(len, position).collect(),
+        Pick::Successor => unreachable!("handled above"),
+    }
 }
 
 /// Loads the first image at or after `start` in the given direction, skipping
@@ -705,13 +975,7 @@ fn load_scanning(
     if entries.is_empty() {
         return None;
     }
-
-    for index in indices {
-        if let Some(image) = try_load(&entries[index]) {
-            return Some((index, image));
-        }
-    }
-    None
+    load_first(entries, indices)
 }
 
 /// All indices of a listing of `len` entries, starting at `start` and
@@ -725,10 +989,31 @@ fn wrapping_indices(len: usize, start: usize, step: Step) -> impl Iterator<Item 
 
 /// Every index of a listing of `len` entries except `current`, in random
 /// order.
-fn shuffled_others(len: usize, current: Option<usize>) -> Vec<usize> {
-    let mut others: Vec<usize> = (0..len).filter(|&index| Some(index) != current).collect();
+fn shuffled_others(len: usize, current: usize) -> Vec<usize> {
+    let mut others: Vec<usize> = (0..len).filter(|&index| index != current).collect();
     fastrand::shuffle(&mut others);
     others
+}
+
+/// Every index of a listing of `len` entries, nearest to `target` first and
+/// the lower index first on a tie (spec §8.3). A `target` past the end counts
+/// as the last index.
+fn nearest_indices(len: usize, target: usize) -> impl Iterator<Item = usize> {
+    let target = target.min(len.saturating_sub(1));
+    (0..len).flat_map(move |distance| {
+        let lower = target.checked_sub(distance);
+        let upper = Some(target + distance).filter(|&index| distance > 0 && index < len);
+        lower.into_iter().chain(upper)
+    })
+}
+
+/// A gallery of `entries` showing the usable image nearest to `target`, or
+/// the empty-folder message if there is none.
+fn gallery_near(folder: PathBuf, entries: Vec<PathBuf>, target: usize) -> Content {
+    match load_nearest(&entries, target) {
+        Some((index, image)) => Content::Gallery(Gallery::new(folder, entries, index, image)),
+        None => Content::Message(message_for_empty_folder(&folder)),
+    }
 }
 
 /// Loads the first usable image among `indices`, skipping files that no
@@ -745,46 +1030,15 @@ fn load_first(
 /// Loads the image closest to `target`, preferring the lower index when the
 /// distance is equal (spec §8.3).
 fn load_nearest(entries: &[PathBuf], target: usize) -> Option<(usize, Arc<RenderImage>)> {
-    if entries.is_empty() {
-        return None;
-    }
-
-    let target = target.min(entries.len() - 1);
-    for distance in 0..entries.len() {
-        // Lower index first: on a tie the earlier file wins.
-        if let Some(index) = target.checked_sub(distance) {
-            if let Some(image) = try_load(&entries[index]) {
-                return Some((index, image));
-            }
-        }
-        if distance > 0 {
-            let index = target + distance;
-            if index < entries.len() {
-                if let Some(image) = try_load(&entries[index]) {
-                    return Some((index, image));
-                }
-            }
-        }
-    }
-    None
+    load_first(entries, nearest_indices(entries.len(), target))
 }
 
-/// Decodes one file, treating any failure as "this image is not there".
+/// Decodes one file on the spot, treating any failure as "this image is not
+/// there".
 fn try_load(path: &Path) -> Option<Arc<RenderImage>> {
-    match media::decode(path) {
-        Ok(decoded) => {
-            log::debug!(
-                "showing {} ({}x{})",
-                path.display(),
-                decoded.width(),
-                decoded.height()
-            );
-            Some(decoded.into_render_image())
-        }
-        Err(error) => {
-            log::error!("skipping {}: {error:#}", path.display());
-            None
-        }
+    match prefetch::decode(path).outcome {
+        Outcome::Image(image) => Some(image),
+        Outcome::Missing | Outcome::Unusable => None,
     }
 }
 
@@ -814,7 +1068,8 @@ mod tests {
     // Deliberately not `use super::*`: that would re-export GPUI's own `test`
     // attribute over Rust's.
     use super::{
-        load_first, load_nearest, load_scanning, position_of, shuffled_others, wrapping_indices,
+        candidates, load_first, load_nearest, load_scanning, nearest_indices, shuffled_others,
+        wrapping_indices, Pick,
     };
     use crate::library::{self, Step};
     use crate::test_support::TempTree;
@@ -933,21 +1188,14 @@ mod tests {
 
     #[test]
     fn shuffled_others_leaves_out_only_the_current_image() {
-        let mut others = shuffled_others(5, Some(2));
+        let mut others = shuffled_others(5, 2);
         others.sort_unstable();
         assert_eq!(others, [0, 1, 3, 4]);
     }
 
     #[test]
     fn shuffled_others_of_a_single_image_is_empty() {
-        assert!(shuffled_others(1, Some(0)).is_empty());
-    }
-
-    #[test]
-    fn shuffled_others_without_a_current_image_offers_every_index() {
-        let mut others = shuffled_others(3, None);
-        others.sort_unstable();
-        assert_eq!(others, [0, 1, 2]);
+        assert!(shuffled_others(1, 0).is_empty());
     }
 
     #[test]
@@ -955,17 +1203,92 @@ mod tests {
         let (_tree, entries) = folder_with_a_broken_middle("random-broken");
         // From 1.png the only usable other image is 3.png, whatever the order.
         for _ in 0..20 {
-            let (index, _) = load_first(&entries, shuffled_others(entries.len(), Some(0)))
-                .expect("another image");
+            let (index, _) =
+                load_first(&entries, shuffled_others(entries.len(), 0)).expect("another image");
             assert_eq!(index, 2);
         }
     }
 
+    fn listing(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn order(pick: Pick, entries: &[PathBuf], anchor: &str, anchor_index: usize) -> Vec<usize> {
+        candidates(pick, entries, &PathBuf::from(anchor), anchor_index).into()
+    }
+
     #[test]
-    fn position_of_tracks_a_file_that_moved_in_the_listing() {
-        let previous = vec![PathBuf::from("a.png"), PathBuf::from("b.png")];
-        let entries = vec![PathBuf::from("b.png")];
-        assert_eq!(position_of(&entries, &previous, 1), Some(0));
-        assert_eq!(position_of(&entries, &previous, 0), None);
+    fn stepping_tries_every_other_image_once_from_the_anchor() {
+        let entries = listing(&["a", "b", "c", "d"]);
+        assert_eq!(
+            order(Pick::Step(Step::Forward), &entries, "c", 2),
+            [3, 0, 1]
+        );
+        assert_eq!(
+            order(Pick::Step(Step::Backward), &entries, "a", 0),
+            [3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn stepping_follows_the_anchor_to_where_it_now_sits() {
+        // "c" was at 2; after "a" vanished and the listing was re-read it is
+        // at 1, and stepping carries on from there.
+        let entries = listing(&["b", "c", "d"]);
+        assert_eq!(order(Pick::Step(Step::Forward), &entries, "c", 2), [2, 0]);
+    }
+
+    #[test]
+    fn a_vanished_anchor_lands_on_the_nearest_image() {
+        let entries = listing(&["a", "b", "d", "e"]);
+        // "c" was at 2: 2 ("d") is nearest, then 1 before 3.
+        assert_eq!(
+            order(Pick::Step(Step::Forward), &entries, "c", 2),
+            [2, 1, 3, 0]
+        );
+    }
+
+    #[test]
+    fn a_random_move_offers_every_other_image() {
+        let entries = listing(&["a", "b", "c"]);
+        let mut others = order(Pick::Random, &entries, "b", 1);
+        others.sort_unstable();
+        assert_eq!(others, [0, 2]);
+    }
+
+    #[test]
+    fn after_delete_the_successor_comes_first_then_wraps() {
+        // "c" was deleted from a, b, c, d, e.
+        let entries = listing(&["a", "b", "d", "e"]);
+        assert_eq!(order(Pick::Successor, &entries, "c", 2), [2, 3, 0, 1]);
+        // Deleting the last image wraps to the first.
+        let entries = listing(&["a", "b"]);
+        assert_eq!(order(Pick::Successor, &entries, "c", 2), [0, 1]);
+    }
+
+    #[test]
+    fn refreshing_tries_the_image_on_screen_first() {
+        let entries = listing(&["a", "b", "c", "d"]);
+        assert_eq!(order(Pick::Nearest, &entries, "c", 0), [2, 1, 3, 0]);
+    }
+
+    #[test]
+    fn an_empty_listing_has_no_candidates() {
+        for pick in [
+            Pick::Step(Step::Forward),
+            Pick::Random,
+            Pick::Successor,
+            Pick::Nearest,
+        ] {
+            assert!(order(pick, &[], "a", 0).is_empty());
+        }
+    }
+
+    #[test]
+    fn nearest_indices_prefer_the_lower_index_on_a_tie() {
+        let indices: Vec<usize> = nearest_indices(5, 2).collect();
+        assert_eq!(indices, [2, 1, 3, 0, 4]);
+        let clamped: Vec<usize> = nearest_indices(3, 9).collect();
+        assert_eq!(clamped, [2, 1, 0]);
     }
 }

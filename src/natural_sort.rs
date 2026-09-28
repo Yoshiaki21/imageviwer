@@ -53,12 +53,15 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 
 /// Compares two names by their natural order, ignoring any directory part.
 pub fn natural_cmp_paths(a: &std::path::Path, b: &std::path::Path) -> Ordering {
-    let name = |p: &std::path::Path| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
-    natural_cmp(&name(a), &name(b))
+    // Borrowed rather than owned: this runs for every comparison of a sort,
+    // and valid UTF-8 names need no copy.
+    natural_cmp(&file_name(a), &file_name(b))
+}
+
+fn file_name(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default()
 }
 
 /// Consumes a digit run, returning its digits without leading zeros and the
