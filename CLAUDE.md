@@ -52,6 +52,9 @@
   Windows では gpui が初期化済みの STA に合わせる既定の `coinit_apartmentthreaded` のまま使う）
 - マウスの OS 依存値（ダブルクリック間隔・ホイール1ノッチの行数）: Windows は `windows-sys` の
   `GetDoubleClickTime` / `SPI_GETWHEELSCROLLLINES`、Linux は gpui の固定値（400ms / 3行）に合わせる
+- エラー型: `anyhow 1`（IPC・デコードのエラーに文脈を付けて 1 本のメッセージにするため）
+- `smallvec 1`: `gpui::RenderImage` がフレームを `SmallVec` で受け取るため
+- Windows の exe アイコン: `winresource 0.1`（`build.rs` で `app.ico` を埋め込む。Windows ビルド時のみ）
 - IPC: Linux はロックファイル + Unix ドメインソケット（std のみ）、Windows は名前付き Mutex +
   名前付きパイプ（`windows-sys 0.60`）
 - スレッド間の受け渡し: `async-channel 2`（IPC スレッド → gpui のフォアグラウンドタスク）
@@ -86,6 +89,8 @@
 | 多重起動制御・既存ウィンドウへのパス受け渡し | `src/ipc/mod.rs`（共通 API）、`src/ipc/unix.rs`、`src/ipc/windows.rs` |
 | テスト用の一時ディレクトリ・テスト画像の生成 | `src/test_support.rs`（`#[cfg(test)]` のみ） |
 | ファイル関連付けの手順書 | `docs/file-association.md` |
+| アプリのアイコン | Windows は `app.ico`（`build.rs` で exe に埋め込む）、KDE は `app.png`（`.desktop` の `Icon=`） |
+| KDE 用の `.desktop`（開発者の実機用。パスは開発者の環境のもの） | `imageviewer.desktop` |
 
 ### 4. 設計方針・規約
 
@@ -165,7 +170,8 @@ cargo run -- /path/to/image.png
   巨大な画像ではその瞬間だけ固まる。↑↓ を押しっぱなしにした場合も同様。
 - 先読みのメモリは 1 枚＝幅×高さ×4 バイト。既定（先 4・前 2）で 2304×1792 なら約 115MB、
   上限は `[prefetch] memory_mb`。
-- `config.toml` の書き出しは終了時（ウィンドウを閉じる／Esc／Ctrl+Q）のみ。強制終了では保存されない。
+- `config.toml` の書き出しは終了時（ウィンドウを閉じる／Esc／Ctrl+Q）と、起動時に `[last_opened]` が
+  使えず記録を消したときだけ。強制終了ではその回の位置・ウィンドウサイズ・`[folder_history]` は保存されない。
 - 複数ファイルの同時オープンには対応しない。`.desktop` の `Exec` は `%F` ではなく `%f`。
 
 ### 7. 変更履歴
