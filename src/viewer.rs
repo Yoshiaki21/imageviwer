@@ -11,6 +11,7 @@ use std::time::Duration;
 use gpui_kit::*;
 
 use crate::config::{Config, LastOpened, PrefetchConfig, WindowConfig};
+use crate::folder_history::FolderHistory;
 use crate::library::{self, Step};
 use crate::natural_sort::natural_cmp_paths;
 use crate::pointer::{self, ClickArea, WheelNotches};
@@ -147,6 +148,8 @@ pub struct ViewerView {
     /// Images taken off screen that nothing keeps any more; their textures
     /// are freed by the next `release_textures`.
     orphaned: Vec<Arc<RenderImage>>,
+    /// The image last shown in each folder left so far, for coming back.
+    folder_history: FolderHistory,
 }
 
 impl ViewerView {
@@ -154,11 +157,12 @@ impl ViewerView {
         startup: Startup,
         caption_duration: Duration,
         prefetch: &PrefetchConfig,
+        folder_history: FolderHistory,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let content = match startup {
-            Startup::Image(path) => Self::open_file(&path),
+            Startup::Image(path) => open_file(&path, &folder_history),
             Startup::Restored { folder, index } => Self::open_folder_at(&folder, index),
             Startup::Message(text) => Content::Message(text.into()),
         };
@@ -179,6 +183,7 @@ impl ViewerView {
             direction: Step::Forward,
             seek: None,
             orphaned: Vec::new(),
+            folder_history,
         };
         view.content_changed(window, cx);
         view
@@ -203,7 +208,7 @@ impl ViewerView {
         };
 
         log::debug!("launch request for {}", path.display());
-        let content = Self::open_file(&path);
+        let content = open_file(&path, &self.folder_history);
         self.replace_content(content, window, cx);
     }
 
@@ -228,7 +233,14 @@ impl ViewerView {
             height: f32::from(bounds.size.height).round().max(0.) as u32,
         });
 
+        // Entries come from this session, the limit from the file, so that an
+        // edit made while running takes effect.
+        config.folder_history.entries = self.folder_history.entries.clone();
         if let Content::Gallery(gallery) = &self.content {
+            config
+                .folder_history
+                .remember(&gallery.folder, &gallery.shown);
+
             // The image the user last saw, not a move still waiting for it.
             let index = gallery
                 .entries
@@ -648,7 +660,7 @@ impl ViewerView {
     }
 
     /// Moves to the previous/next sibling folder that holds images and shows
-    /// its first image (spec §4).
+    /// the image last seen there, or its first image (spec §4).
     fn step_folder(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("step folder {step:?}");
         let Content::Gallery(gallery) = &self.content else {
@@ -658,7 +670,8 @@ impl ViewerView {
         let mut from = gallery.folder.clone();
         while let Some(folder) = library::next_folder_with_images(&from, step) {
             let entries = library::list_images(&folder);
-            if let Some((index, image)) = load_scanning(&entries, 0, Step::Forward) {
+            let remembered = self.folder_history.recall(&folder);
+            if let Some((index, image)) = load_remembered(&entries, remembered) {
                 self.replace_content(
                     Content::Gallery(Gallery::new(folder, entries, index, image)),
                     window,
@@ -686,6 +699,8 @@ impl ViewerView {
         self.seek = None;
         self.direction = Step::Forward;
         if let Content::Gallery(previous) = &self.content {
+            self.folder_history
+                .remember(&previous.folder, &previous.shown);
             if !self.prefetch.holds(&previous.image) {
                 self.orphaned.push(previous.image.clone());
             }
@@ -761,26 +776,6 @@ impl ViewerView {
                 cx.notify();
             });
         }));
-    }
-
-    /// Opens the folder containing `path` and shows `path` itself, or the
-    /// nearest usable image if it cannot be displayed.
-    fn open_file(path: &Path) -> Content {
-        if path.is_dir() {
-            return Self::open_folder_at(path, 0);
-        }
-
-        let Some(folder) = path.parent().map(PathBuf::from) else {
-            return Content::Message(message_for_missing(path));
-        };
-
-        let entries = library::list_images(&folder);
-        let target = entries.iter().position(|entry| entry == path).unwrap_or(0);
-
-        match load_nearest(&entries, target) {
-            Some((index, image)) => Content::Gallery(Gallery::new(folder, entries, index, image)),
-            None => Content::Message(message_for_missing(path)),
-        }
     }
 
     /// Opens `folder` at the saved index, or the nearest usable image to it
@@ -1007,6 +1002,50 @@ fn nearest_indices(len: usize, target: usize) -> impl Iterator<Item = usize> {
     })
 }
 
+/// Opens the folder containing `path` and shows `path` itself, or the nearest
+/// usable image if it cannot be displayed. A folder path opens at the image
+/// last seen there, as ↑ / ↓ would.
+fn open_file(path: &Path, folder_history: &FolderHistory) -> Content {
+    if path.is_dir() {
+        let entries = library::list_images(path);
+        return match load_remembered(&entries, folder_history.recall(path)) {
+            Some((index, image)) => {
+                Content::Gallery(Gallery::new(path.to_path_buf(), entries, index, image))
+            }
+            None => Content::Message(message_for_empty_folder(path)),
+        };
+    }
+
+    let Some(folder) = path.parent().map(PathBuf::from) else {
+        return Content::Message(message_for_missing(path));
+    };
+
+    let entries = library::list_images(&folder);
+    let target = entries.iter().position(|entry| entry == path).unwrap_or(0);
+
+    match load_nearest(&entries, target) {
+        Some((index, image)) => Content::Gallery(Gallery::new(folder, entries, index, image)),
+        None => Content::Message(message_for_missing(path)),
+    }
+}
+
+/// Loads the image named `remembered` if it is listed and usable, otherwise
+/// the first usable image: a remembered image that is gone sends the user to
+/// the start of the folder, not next to where it was (spec §4).
+fn load_remembered(
+    entries: &[PathBuf],
+    remembered: Option<&str>,
+) -> Option<(usize, Arc<RenderImage>)> {
+    let remembered = remembered.and_then(|name| {
+        entries
+            .iter()
+            .position(|entry| entry.file_name().is_some_and(|file| file == name))
+    });
+    remembered
+        .and_then(|index| try_load(&entries[index]).map(|image| (index, image)))
+        .or_else(|| load_scanning(entries, 0, Step::Forward))
+}
+
 /// A gallery of `entries` showing the usable image nearest to `target`, or
 /// the empty-folder message if there is none.
 fn gallery_near(folder: PathBuf, entries: Vec<PathBuf>, target: usize) -> Content {
@@ -1068,8 +1107,8 @@ mod tests {
     // Deliberately not `use super::*`: that would re-export GPUI's own `test`
     // attribute over Rust's.
     use super::{
-        candidates, load_first, load_nearest, load_scanning, nearest_indices, shuffled_others,
-        wrapping_indices, Pick,
+        candidates, load_first, load_nearest, load_remembered, load_scanning, nearest_indices,
+        shuffled_others, wrapping_indices, Pick,
     };
     use crate::library::{self, Step};
     use crate::test_support::TempTree;
@@ -1085,6 +1124,34 @@ mod tests {
         let entries = library::list_images(&folder);
         assert_eq!(entries.len(), 3);
         (tree, entries)
+    }
+
+    #[test]
+    fn a_remembered_image_is_shown_again() {
+        let (_tree, entries) = folder_with_a_broken_middle("remembered-shown");
+        let (index, _) = load_remembered(&entries, Some("3.png")).expect("an image");
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn a_remembered_image_that_is_gone_starts_from_the_first() {
+        let (_tree, entries) = folder_with_a_broken_middle("remembered-gone");
+        let (index, _) = load_remembered(&entries, Some("4.png")).expect("an image");
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn a_remembered_image_that_is_broken_starts_from_the_first() {
+        let (_tree, entries) = folder_with_a_broken_middle("remembered-broken");
+        let (index, _) = load_remembered(&entries, Some("2.png")).expect("an image");
+        assert_eq!(index, 0, "not the nearest usable image, 3.png");
+    }
+
+    #[test]
+    fn nothing_remembered_starts_from_the_first() {
+        let (_tree, entries) = folder_with_a_broken_middle("remembered-none");
+        let (index, _) = load_remembered(&entries, None).expect("an image");
+        assert_eq!(index, 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::app_paths;
+use crate::folder_history::FolderHistory;
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +25,8 @@ pub struct Config {
     pub prefetch: PrefetchConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub folder_history: FolderHistory,
 }
 
 /// Position and size of the window at the previous exit, in screen pixels.
@@ -255,6 +258,29 @@ impl Config {
             Some(true) => out.push_str("verbose = true\n"),
             _ => out.push_str("# verbose = false\n"),
         }
+        out.push('\n');
+
+        // Last, so that a long list of folders does not bury the settings.
+        out.push_str("[folder_history]\n");
+        out.push_str(
+            "# ↑↓ でフォルダに戻ったとき、前回見ていた画像から表示するために覚えておくフォルダの数。0 で覚えない。\n",
+        );
+        out.push_str(&format!(
+            "max_folders = {}\n",
+            self.folder_history.max_folders
+        ));
+        if !self.folder_history.entries.is_empty() {
+            out.push('\n');
+            out.push_str("# 以下は自動で記録される（最後に見た順）。\n");
+        }
+        for entry in &self.folder_history.entries {
+            out.push_str("[[folder_history.entries]]\n");
+            out.push_str(&format!(
+                "folder = {}\n",
+                quote(&entry.folder.to_string_lossy())
+            ));
+            out.push_str(&format!("file = {}\n", quote(&entry.file)));
+        }
 
         out
     }
@@ -328,6 +354,7 @@ mod tests {
             overlay: OverlayConfig { duration_ms: 1500 },
             prefetch: PrefetchConfig::default(),
             logging: LoggingConfig::default(),
+            folder_history: FolderHistory::default(),
         };
 
         let parsed = roundtrip(&config);
@@ -353,6 +380,32 @@ mod tests {
         config.prefetch.memory_mb = 2048;
         let parsed = roundtrip(&config).prefetch;
         assert_eq!((parsed.ahead, parsed.behind, parsed.memory_mb), (8, 3, 2048));
+    }
+
+    #[test]
+    fn folder_history_defaults_and_survives_a_roundtrip() {
+        let defaults = roundtrip(&Config::default()).folder_history;
+        assert_eq!(defaults.max_folders, 100);
+        assert!(defaults.entries.is_empty());
+
+        let mut config = Config::default();
+        config.folder_history.max_folders = 5;
+        config
+            .folder_history
+            .remember(Path::new(r"C:\Pics\a"), Path::new(r#"C:\Pics\a\img "1".png"#));
+        config
+            .folder_history
+            .remember(Path::new("/pics/b"), Path::new("/pics/b/画像.jpg"));
+        let parsed = roundtrip(&config).folder_history;
+        assert_eq!(parsed.max_folders, 5);
+        assert_eq!(parsed.entries, config.folder_history.entries);
+    }
+
+    #[test]
+    fn a_file_without_a_folder_history_section_uses_the_defaults() {
+        let parsed: Config = toml::from_str("[overlay]\nduration_ms = 100\n").expect("parses");
+        assert_eq!(parsed.folder_history.max_folders, 100);
+        assert!(parsed.folder_history.entries.is_empty());
     }
 
     #[test]

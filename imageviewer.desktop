@@ -4,7 +4,7 @@ Type=Application
 Name=imageviwer
 #実行ファイルパス
 Exec=/home/lucifar/GitHub/imageviwer/target/release/imageviewer %f
-#Icon=/path/to/icon.png
+Icon=/home/lucifar/GitHub/imageviwer/app.png
 MimeType=image/png;
 Terminal=false
 Categories=Graphics;

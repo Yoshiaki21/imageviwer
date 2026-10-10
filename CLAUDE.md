@@ -69,6 +69,7 @@
 | ←→ のループ（折り返し）・Delete でゴミ箱へ移動・R（と 2・3 の右クリック）でランダム表示 | `src/viewer.rs` の `step_image()` / `on_delete_image()` / `show_random_image()`（巡回順は `wrapping_indices()`、ランダム順は `shuffled_others()`） |
 | 同じフォルダ内の移動（候補順・待ち合わせ・欠損時の読み直し）／F5 | `src/viewer.rs` の `start_seek()` / `resolve()` / `on_refresh_listing()`（候補の順番は `candidates()` と `Pick`、欠損の判定は `media::is_missing()`） |
 | 先読み（何を・どの順で・いくつ並行してデコードし、いつ捨てるか） | `src/prefetch.rs` の `Prefetcher` / `window_indices()`。デコードの起動と結果の受け取りは `viewer.rs` の `schedule_decodes()` / `on_decoded()` |
+| ↑↓ で戻ったときの表示位置（フォルダごとの閲覧位置の記憶・上限・忘れる順番） | `src/folder_history.rs` の `FolderHistory`（`[folder_history]`）。記録は `viewer.rs` の `replace_content()` と `save_state()`、使うのは `step_folder()` と `open_file()`（`load_remembered()`） |
 | 先読みの枚数・メモリ上限の設定 | `config.rs` の `PrefetchConfig`（`[prefetch]`） |
 | GPU テクスチャの解放 | `viewer.rs` の `release_textures()`（`Prefetcher::take_released()` と `orphaned`） |
 | マウス操作（4分割クリック・右クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_right_mouse_down()` / `on_scroll_wheel()` |
@@ -110,6 +111,9 @@
   捨て、並行数の枠も完了まで確保したままにする（取り消すと実際の並行数が上限を超えるため）。
 - **デコード済みの画像は表示直前にファイルのサイズ・更新日時を確認する（`FileStamp`）。** キャッシュから
   出すとファイルを開かないので、削除・上書きに気付けないため。
+- **フォルダごとの閲覧位置はファイル名で覚え、無ければ先頭から。** 番号で覚えると F5・Delete で
+  別の画像を指すため。起動時の復元（`[last_opened]` の番号＋最も近い画像）とは別の仕組みのまま（仕様 §8 を変えないため）。
+  フォルダの比較は Windows だけ大文字・小文字を区別しない（関連付けと ↑↓ でパスの綴りが違いうるため）。
 - **GPU テクスチャは、画面にもキャッシュにも無くなった画像だけ解放する。** キャッシュにある画像の
   テクスチャを残すと、戻ったときに再転送が要らない。
 - **フォルダ列挙では `Path::is_file()` / `is_dir()` を使わない。** `DirEntry::file_type()` を使う
@@ -177,6 +181,8 @@ cargo run -- /path/to/image.png
 - 2026-09-28: 大きい画像で押しっぱなしの表示が止まる問題を修正。同じフォルダ内の移動のデコードを
   別スレッド化し、前後の先読みとデコード済み画像のキャッシュ（`src/prefetch.rs`、`[prefetch]`）を追加。
   以上を Windows 版と KDE 版の実機で確認。
+- 2026-10-10: ↑↓ で戻ったフォルダを前回見ていた画像から表示するよう変更（`src/folder_history.rs`、
+  `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版の実機で確認。
 
 ---
 

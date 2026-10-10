@@ -10,6 +10,7 @@
 
 mod app_paths;
 mod config;
+mod folder_history;
 mod ipc;
 mod library;
 mod logging;
@@ -73,6 +74,7 @@ fn main() {
 fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: Config) {
     let overlay_duration = config.overlay.duration();
     let prefetch = config.prefetch.clone();
+    let folder_history = config.folder_history.clone();
     let startup = decide_startup(requested_path, config);
 
     gpui_kit::application()
@@ -84,7 +86,9 @@ fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: C
             let options = window_options(cx);
             let mut viewer: Option<Entity<ViewerView>> = None;
             let opened = cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| ViewerView::new(startup, overlay_duration, &prefetch, window, cx));
+                let view = cx.new(|cx| {
+                    ViewerView::new(startup, overlay_duration, &prefetch, folder_history, window, cx)
+                });
                 viewer = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             });
