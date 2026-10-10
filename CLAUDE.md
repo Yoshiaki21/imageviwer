@@ -182,7 +182,7 @@ cargo run -- /path/to/image.png
   別スレッド化し、前後の先読みとデコード済み画像のキャッシュ（`src/prefetch.rs`、`[prefetch]`）を追加。
   以上を Windows 版と KDE 版の実機で確認。
 - 2026-10-10: ↑↓ で戻ったフォルダを前回見ていた画像から表示するよう変更（`src/folder_history.rs`、
-  `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版の実機で確認。
+  `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版と Windows 版の実機で確認。
 
 ---
 
