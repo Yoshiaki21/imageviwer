@@ -1,11 +1,14 @@
 //! Helpers shared by the unit tests: a self-cleaning directory tree that can
-//! be filled with real PNG and JPEG files.
+//! be filled with real PNG, JPEG and JPEG XL files.
 
 #![cfg(test)]
 
 use std::path::PathBuf;
 
-use image::{ImageFormat, Rgb, RgbImage};
+use image::{ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
+use zune_core::bit_depth::BitDepth;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::EncoderOptions;
 
 /// A directory under the system temp dir that removes itself on drop.
 pub struct TempTree(PathBuf);
@@ -22,7 +25,6 @@ impl TempTree {
         std::fs::create_dir_all(&root).expect("create temp root");
         Self(root)
     }
-
 
     pub fn dir(&self, relative: &str) -> PathBuf {
         let path = self.0.join(relative);
@@ -56,12 +58,42 @@ impl TempTree {
         {
             Some("png") => ImageFormat::Png,
             Some("jpg") | Some("jpeg") => ImageFormat::Jpeg,
+            // `image` cannot encode JPEG XL, and jxl-rs only decodes.
+            Some("jxl") => {
+                std::fs::write(
+                    &path,
+                    encode_jxl(buffer.as_raw(), width, height, ColorSpace::RGB),
+                )
+                .expect("write jxl");
+                return path;
+            }
             other => panic!("unsupported test image extension: {other:?}"),
         };
 
-        buffer.save_with_format(&path, format).expect("encode image");
+        buffer
+            .save_with_format(&path, format)
+            .expect("encode image");
         path
     }
+
+    /// Writes a real single-colour JPEG XL image with an alpha channel.
+    pub fn jxl_rgba(&self, relative: &str, width: u32, height: u32, rgba: [u8; 4]) -> PathBuf {
+        let pixels = RgbaImage::from_pixel(width, height, Rgba(rgba));
+        self.write(
+            relative,
+            &encode_jxl(pixels.as_raw(), width, height, ColorSpace::RGBA),
+        )
+    }
+}
+
+/// Encodes 8-bit pixels as a lossless JPEG XL file.
+fn encode_jxl(pixels: &[u8], width: u32, height: u32, colorspace: ColorSpace) -> Vec<u8> {
+    let options = EncoderOptions::new(width as usize, height as usize, colorspace, BitDepth::Eight);
+    let mut encoded = Vec::new();
+    zune_jpegxl::JxlSimpleEncoder::new(pixels, options)
+        .encode(&mut encoded)
+        .expect("encode jxl");
+    encoded
 }
 
 impl Drop for TempTree {

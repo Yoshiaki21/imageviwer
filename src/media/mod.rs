@@ -1,10 +1,11 @@
 //! Image decoding, kept behind an extension → format → decoder indirection.
 //!
-//! Only PNG and JPEG are in scope (spec §6). Adding a format means adding an
+//! PNG, JPEG and JPEG XL are in scope (spec §6). Adding a format means adding an
 //! [`ImageFormat`] variant; every `match` on it here is exhaustive, so the
 //! compiler points at each place that still needs work.
 
 mod jpeg;
+mod jxl;
 mod png;
 
 use std::path::Path;
@@ -60,17 +61,19 @@ impl DecodedImage {
 pub enum ImageFormat {
     Png,
     Jpeg,
+    Jxl,
 }
 
 impl ImageFormat {
     /// Every supported format. Extend together with the enum.
-    pub const ALL: [ImageFormat; 2] = [ImageFormat::Png, ImageFormat::Jpeg];
+    pub const ALL: [ImageFormat; 3] = [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Jxl];
 
     /// Lower-case extensions that map to this format.
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             ImageFormat::Png => &["png"],
             ImageFormat::Jpeg => &["jpg", "jpeg"],
+            ImageFormat::Jxl => &["jxl"],
         }
     }
 
@@ -91,6 +94,7 @@ impl ImageFormat {
         match self {
             ImageFormat::Png => &png::PngDecoder,
             ImageFormat::Jpeg => &jpeg::JpegDecoder,
+            ImageFormat::Jxl => &jxl::JxlDecoder,
         }
     }
 }
@@ -165,6 +169,7 @@ mod tests {
         assert_eq!(ImageFormat::from_extension("PNG"), Some(ImageFormat::Png));
         assert_eq!(ImageFormat::from_extension("Jpg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::from_extension("jpeg"), Some(ImageFormat::Jpeg));
+        assert_eq!(ImageFormat::from_extension("JXL"), Some(ImageFormat::Jxl));
         assert_eq!(ImageFormat::from_extension("bmp"), None);
     }
 
@@ -208,6 +213,62 @@ mod tests {
         assert!(r.abs_diff(200) < 12, "red was {r}");
         assert!(g.abs_diff(40) < 12, "green was {g}");
         assert!(b.abs_diff(90) < 12, "blue was {b}");
+    }
+
+    #[test]
+    fn jxl_decodes_to_bgra_at_the_right_size() {
+        let tree = TempTree::new("decode-jxl");
+        let path = tree.image("a.JXL", 7, 3, [10, 20, 30]);
+
+        let decoded = decode(&path).expect("decodes");
+        assert_eq!((decoded.width(), decoded.height()), (7, 3));
+        // Lossless, so the channels come back exactly.
+        assert_eq!(decoded.pixel(0, 0), [30, 20, 10, 255]);
+        assert_eq!(decoded.pixel(6, 2), [30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn jxl_keeps_its_alpha() {
+        let tree = TempTree::new("decode-jxl-alpha");
+        let path = tree.jxl_rgba("a.jxl", 5, 4, [10, 20, 30, 128]);
+
+        let decoded = decode(&path).expect("decodes");
+        assert_eq!(decoded.pixel(2, 2), [30, 20, 10, 128]);
+    }
+
+    #[test]
+    fn a_corrupt_jxl_fails_instead_of_panicking() {
+        let tree = TempTree::new("corrupt-jxl");
+        // A valid codestream signature followed by garbage.
+        let path = tree.write("broken.jxl", b"\xff\x0anot really a jpeg xl");
+        let error = decode(&path).err().expect("corrupt");
+        assert!(!is_missing(&error));
+    }
+
+    #[test]
+    fn a_truncated_jxl_fails() {
+        let tree = TempTree::new("truncated-jxl");
+        let whole = tree.image("whole.jxl", 64, 64, [1, 2, 3]);
+        let bytes = std::fs::read(&whole).expect("read");
+        let path = tree.write("truncated.jxl", &bytes[..bytes.len() / 2]);
+        assert!(decode(&path).is_err());
+    }
+
+    #[test]
+    fn a_missing_jxl_is_reported_as_missing() {
+        let error = decode(Path::new("/nonexistent/none.jxl"))
+            .err()
+            .expect("no such file");
+        assert!(is_missing(&error));
+    }
+
+    #[test]
+    fn a_png_named_jxl_fails() {
+        let tree = TempTree::new("mislabelled-jxl");
+        let png = tree.image("real.png", 8, 8, [1, 2, 3]);
+        let bytes = std::fs::read(&png).expect("read");
+        let path = tree.write("mislabelled.jxl", &bytes);
+        assert!(decode(&path).is_err());
     }
 
     #[test]

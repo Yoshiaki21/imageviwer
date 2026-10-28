@@ -45,6 +45,11 @@
   `gpui_kit::component` が gpui-component。
 - 画像デコード: `image 0.25`（`png` / `jpeg` フィーチャのみ）。gpui 自身と同じメジャー版なので
   `image::Frame` が `gpui::RenderImage` にそのまま渡せる。
+- JPEG XL: `jxl-image-rs-integration 0.8`（jxl-rs の `image` 用アダプタ。jxl-rs 本体 `jxl` は `=0.8.0` に固定される）。
+  `image::DynamicImage` に乗るので PNG/JPEG と同じ BGRA 変換を使い回せるため。向きの補正は jxl-rs が行う。
+  出力の色空間を指定する API が無いので、埋め込みプロファイルが sRGB 以外の可逆画像はそのまま 8bit に丸めて表示する。
+- テスト用の JPEG XL の生成: `zune-jpegxl` + `zune-core`（dev-dependencies のみ）。`image` も jxl-rs も
+  JPEG XL をエンコードできず、バイナリのテスト画像をリポジトリに置かずに済むため。
 - 設定: `toml 0.9` + `serde`（読み込みのみ。書き出しは手書き。理由は §4）
 - ログ: `log 0.4` + 自前のファイルロガー + `chrono`（タイムスタンプ）
 - 乱数: `fastrand 2`（R キー・右クリックのランダム表示用。gpui の依存に既に含まれていて追加のビルドが要らないため）
@@ -79,7 +84,7 @@
 | クリック位置→エリアの判定、ダブルクリック間隔、ホイールのノッチ換算 | `src/pointer.rs` |
 | フォルダ名・ファイル名の表示／「前（次）のフォルダはありません」等のお知らせ | `src/viewer.rs` の `show_caption()` / `display_caption()` / `render_caption()`（種類は `CaptionText`）、表示時間は `config.rs` の `OverlayConfig` |
 | 対応画像フォーマットの追加 | `src/media/mod.rs` の `ImageFormat` に列挙子を追加し、`src/media/<形式>.rs` を作る |
-| 画像のデコード処理そのもの | `src/media/png.rs` / `src/media/jpeg.rs`（共通部は `mod.rs` の `decode_as`） |
+| 画像のデコード処理そのもの | `src/media/png.rs` / `src/media/jpeg.rs`（共通部は `mod.rs` の `decode_as`）、`src/media/jxl.rs`（`image` に JXL の列挙子が無いので `decode_as` を通さない） |
 | フォルダ走査・次/前の画像・兄弟フォルダ探索 | `src/library.rs` |
 | ファイル名の並び順 | `src/natural_sort.rs` |
 | `config.toml` の項目追加・書式変更 | `src/config.rs` |
@@ -172,6 +177,11 @@ cargo run -- /path/to/image.png
   上限は `[prefetch] memory_mb`。
 - `config.toml` の書き出しは終了時（ウィンドウを閉じる／Esc／Ctrl+Q）と、起動時に `[last_opened]` が
   使えず記録を消したときだけ。強制終了ではその回の位置・ウィンドウサイズ・`[folder_history]` は保存されない。
+- **jxl-rs は発展途上（0.x）。このプロジェクトを更新するときは毎回、jxl-rs（crates.io の `jxl` /
+  `jxl-image-rs-integration`）の新しい版が出ていないか確認し、できれば最新版に更新する。**
+  0.x の間は版が上がるたびに API が変わりうるので、`Cargo.toml` の版指定を上げて `src/media/jxl.rs` を
+  直し、`cargo test` を通す。出力の色空間を指定する API が増えていれば sRGB 出力に切り替える（仕様 §6）。
+  互換性のない版しかなく更新を見送る場合は、その理由を一言ここに残す。
 - 複数ファイルの同時オープンには対応しない。`.desktop` の `Exec` は `%F` ではなく `%f`。
 
 ### 7. 変更履歴
@@ -189,6 +199,8 @@ cargo run -- /path/to/image.png
   以上を Windows 版と KDE 版の実機で確認。
 - 2026-10-10: ↑↓ で戻ったフォルダを前回見ていた画像から表示するよう変更（`src/folder_history.rs`、
   `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版と Windows 版の実機で確認。
+- 2026-10-28: JPEG XL（`.jxl`）の読み込みに対応（`src/media/jxl.rs`、jxl-rs 0.8）。アニメーションは先頭フレームのみ。
+  Windows 版の実機で確認（KDE 版は未確認）。
 
 ---
 
