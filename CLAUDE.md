@@ -200,7 +200,7 @@ cargo run -- /path/to/image.png
 - 2026-10-10: ↑↓ で戻ったフォルダを前回見ていた画像から表示するよう変更（`src/folder_history.rs`、
   `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版と Windows 版の実機で確認。
 - 2026-10-28: JPEG XL（`.jxl`）の読み込みに対応（`src/media/jxl.rs`、jxl-rs 0.8）。アニメーションは先頭フレームのみ。
-  Windows 版の実機で確認（KDE 版は未確認）。
+  Windows 版と KDE 版の実機で確認。
 
 ---
 

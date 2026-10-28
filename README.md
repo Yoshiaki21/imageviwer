@@ -182,7 +182,7 @@ OS 側の設定手順は [`docs/file-association.md`](docs/file-association.md) 
 PNG・JPEG・JPEG XL（`.jxl`）のみ。BMP / GIF などは未対応です。
 JPEG XL は [jxl-rs](https://github.com/libjxl/jxl-rs) でデコードします。アニメーションは先頭フレームだけを表示し、
 HDR・広色域の画像は sRGB 相当で表示します（正確な色変換はしません）。
-Windows 版の実機で動作を確認済みです（KDE 版は未確認）。
+Windows 版と KDE 版の実機で動作を確認済みです。
 jxl-rs はまだ発展途上（0.x 版）のライブラリで、一部の画像を表示できない、他のビュワーより
 デコードが遅い、といったことがありえます。
 
