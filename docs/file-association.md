@@ -19,6 +19,7 @@
 ```bash
 mkdir -p ~/.local/opt/imageviewer
 cp target/release/imageviewer ~/.local/opt/imageviewer/
+cp ./app.png ~/.local/opt/imageviewer/
 ```
 
 ### 2. `.desktop` ファイルを作る
@@ -31,6 +32,7 @@ Type=Application
 Name=imageviewer
 Comment=Minimal image viewer
 Exec=/home/<ユーザー名>/.local/opt/imageviewer/imageviewer %f
+Icon=/home/<ユーザー名>/.local/opt/imageviewer/app.png
 Terminal=false
 NoDisplay=false
 Categories=Graphics;Viewer;
