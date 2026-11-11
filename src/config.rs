@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub prefetch: PrefetchConfig,
     #[serde(default)]
+    pub zoom: ZoomConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub folder_history: FolderHistory,
@@ -115,6 +117,35 @@ fn default_prefetch_behind() -> usize {
 
 fn default_prefetch_memory_mb() -> usize {
     1024
+}
+
+/// Ctrl + wheel zoom (spec §5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoomConfig {
+    /// How much one wheel notch magnifies, in percent. 0 turns zoom off.
+    #[serde(default = "default_zoom_step_percent")]
+    pub step_percent: u32,
+}
+
+impl Default for ZoomConfig {
+    fn default() -> Self {
+        Self {
+            step_percent: default_zoom_step_percent(),
+        }
+    }
+}
+
+impl ZoomConfig {
+    /// The magnification of one notch (1.25 for 25%), or `None` when zoom is
+    /// turned off.
+    pub fn factor_per_notch(&self) -> Option<f32> {
+        (self.step_percent > 0).then(|| 1. + self.step_percent as f32 / 100.)
+    }
+}
+
+fn default_zoom_step_percent() -> u32 {
+    25
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +269,13 @@ impl Config {
         ));
         out.push('\n');
 
+        out.push_str("[zoom]\n");
+        out.push_str(&format!(
+            "step_percent = {}   # Ctrl+ホイール1ノッチあたりの拡大率（%）。大きいほど速くズームする。0 でズームしない\n",
+            self.zoom.step_percent
+        ));
+        out.push('\n');
+
         out.push_str("[logging]\n");
         out.push_str(&format!(
             "enabled = {}          # ログ出力する/しない（未指定時のデフォルト: true）\n",
@@ -353,6 +391,7 @@ mod tests {
             }),
             overlay: OverlayConfig { duration_ms: 1500 },
             prefetch: PrefetchConfig::default(),
+            zoom: ZoomConfig::default(),
             logging: LoggingConfig::default(),
             folder_history: FolderHistory::default(),
         };
@@ -412,6 +451,29 @@ mod tests {
     fn a_file_without_a_prefetch_section_uses_the_defaults() {
         let parsed: Config = toml::from_str("[overlay]\nduration_ms = 100\n").expect("parses");
         assert_eq!(parsed.prefetch.ahead, 4);
+    }
+
+    #[test]
+    fn zoom_step_defaults_and_survives_a_roundtrip() {
+        let defaults = roundtrip(&Config::default()).zoom;
+        assert_eq!(defaults.step_percent, 25);
+        assert_eq!(defaults.factor_per_notch(), Some(1.25));
+
+        let mut config = Config::default();
+        config.zoom.step_percent = 50;
+        assert_eq!(roundtrip(&config).zoom.step_percent, 50);
+    }
+
+    #[test]
+    fn a_file_without_a_zoom_section_uses_the_default() {
+        let parsed: Config = toml::from_str("[overlay]\nduration_ms = 100\n").expect("parses");
+        assert_eq!(parsed.zoom.step_percent, 25);
+    }
+
+    #[test]
+    fn a_zero_zoom_step_turns_zoom_off() {
+        let config: Config = toml::from_str("[zoom]\nstep_percent = 0\n").expect("parses");
+        assert_eq!(config.zoom.factor_per_notch(), None);
     }
 
     #[test]

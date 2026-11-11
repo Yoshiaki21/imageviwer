@@ -82,6 +82,9 @@
 | GPU テクスチャの解放 | `viewer.rs` の `release_textures()`（`Prefetcher::take_released()` と `orphaned`） |
 | マウス操作（4分割クリック・右クリック・ダブルクリック・ホイール）の割り当て | `src/viewer.rs` の `on_mouse_down()` / `click_area()` / `on_right_mouse_down()` / `on_scroll_wheel()` |
 | クリック位置→エリアの判定、ダブルクリック間隔、ホイールのノッチ換算 | `src/pointer.rs` |
+| ズームの計算（倍率の範囲・カーソル中心・パンの範囲・描画矩形） | `src/zoom.rs` の `Zoom` / `max_scale()` |
+| ズームの操作（Ctrl+ホイール・拡大中のドラッグとクリックの区別）と描画 | `src/viewer.rs` の `zoom_by_wheel()` / `on_mouse_down()` / `on_mouse_move()` / `on_mouse_up()` / `render_image()`、フィットに戻すのは `reset_zoom()` |
+| ズーム速度の設定 | `config.rs` の `ZoomConfig`（`[zoom] step_percent`） |
 | フォルダ名・ファイル名の表示／「前（次）のフォルダはありません」等のお知らせ | `src/viewer.rs` の `show_caption()` / `display_caption()` / `render_caption()`（種類は `CaptionText`）、表示時間は `config.rs` の `OverlayConfig` |
 | 対応画像フォーマットの追加 | `src/media/mod.rs` の `ImageFormat` に列挙子を追加し、`src/media/<形式>.rs` を作る |
 | 画像のデコード処理そのもの | `src/media/png.rs` / `src/media/jpeg.rs`（共通部は `mod.rs` の `decode_as`）、`src/media/jxl.rs`（`image` に JXL の列挙子が無いので `decode_as` を通さない） |
@@ -137,13 +140,18 @@
 - **テストモジュールで `use super::*` を書かない（`src/viewer.rs` など gpui を使うファイル）。**
   `gpui_kit::*` に gpui 独自の `test` マクロが含まれており、Rust の `#[test]` を隠して
   「recursion limit reached while expanding `#[test]`」になる。必要な項目だけ個別に import する。
+- **ズームは画像が切り替わるたびにフィットへ戻す（`show()` / `content_changed()` の `reset_zoom()`）。**
+  画像ごとに大きさが違い、前の倍率・位置を引き継いでも意味が無いため。
+- **拡大中の左クリックは離したときに判定する。** 押した瞬間にクリック待ちを始めると、ゆっくり掴んで
+  ドラッグする間にクリックが発火して画像が変わるため。4px 以上動いたらドラッグ（クリックにしない）。
+  フィット中は従来どおり押した瞬間から待つ。
+- **ズームの計算は `src/zoom.rs` に gpui の型を使わずに置く。** 単体テストで確かめられるようにするため。
 - **右クリックは待たずに即実行する。** 右ボタンにはダブルクリックの動作が無いため。
 - **シングルクリックはダブルクリック間隔だけ遅らせて実行する。** ダブルクリックでフルスクリーンにしたとき
   画像まで移動しないため。待機中のクリックは `pending_click` の `Task` で持ち、drop でキャンセルする。
 - **タイマーは gpui の `Task` をフィールドに保持し、上書き（drop）でキャンセルする。** 表示の消去も同じ方式。
 - 命名は「何であるか」を綴る。`cx` は gpui のもの。
-- 未実装機能（ズーム等）のための抽象化は先回りして作らない。`ViewerView::render_image()` に
-  後から手を入れれば済む構造にとどめてある。
+- 未実装機能のための抽象化は先回りして作らない。
 
 ### 5. よく使うコマンド
 
@@ -201,6 +209,8 @@ cargo run -- /path/to/image.png
   `[folder_history]`）。仕様 §4 の「移動先は先頭の画像」を改めた。KDE 版と Windows 版の実機で確認。
 - 2026-10-28: JPEG XL（`.jxl`）の読み込みに対応（`src/media/jxl.rs`、jxl-rs 0.8）。アニメーションは先頭フレームのみ。
   Windows 版と KDE 版の実機で確認。
+- 2026-11-11: Ctrl+ホイールのズームと拡大中のドラッグ移動を追加（`src/zoom.rs`、`[zoom] step_percent`）。
+  仕様 §5・§12 を改めた。KDE 版の実機で確認。
 
 ---
 

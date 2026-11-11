@@ -17,9 +17,14 @@ use crate::natural_sort::natural_cmp_paths;
 use crate::pointer::{self, ClickArea, WheelNotches};
 use crate::prefetch::{self, Decoded, FileStamp, Lookup, Outcome, Prefetcher};
 use crate::report;
+use crate::zoom::{self, Zoom};
 
 /// How long the caption takes to fade out at the end of its display time.
 const CAPTION_FADE: Duration = Duration::from_millis(300);
+
+/// How far the pointer may move with the button down and still count as a
+/// click rather than a drag of a zoomed image.
+const DRAG_THRESHOLD: f32 = 4.0;
 
 /// Key context for the viewer's bindings.
 pub const KEY_CONTEXT: &str = "ImageViewer";
@@ -150,6 +155,23 @@ pub struct ViewerView {
     orphaned: Vec<Arc<RenderImage>>,
     /// The image last shown in each folder left so far, for coming back.
     folder_history: FolderHistory,
+    /// Magnification and position of the image on screen; fitted again on
+    /// every image change.
+    zoom: Zoom,
+    /// From `[zoom] step_percent`; `None` turns Ctrl + wheel zoom off.
+    zoom_factor: Option<f32>,
+    /// The left button held down on a zoomed image: a drag pans it, a
+    /// release without moving is a click.
+    drag: Option<Drag>,
+}
+
+/// A left-button press on a zoomed image, not yet known to be a click or a
+/// drag.
+struct Drag {
+    area: ClickArea,
+    start: Point<Pixels>,
+    last: Point<Pixels>,
+    moved: bool,
 }
 
 impl ViewerView {
@@ -157,6 +179,7 @@ impl ViewerView {
         startup: Startup,
         caption_duration: Duration,
         prefetch: &PrefetchConfig,
+        zoom_factor: Option<f32>,
         folder_history: FolderHistory,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -184,6 +207,9 @@ impl ViewerView {
             seek: None,
             orphaned: Vec::new(),
             folder_history,
+            zoom: Zoom::fitted(),
+            zoom_factor,
+            drag: None,
         };
         view.content_changed(window, cx);
         view
@@ -384,6 +410,10 @@ impl ViewerView {
     /// click toggles fullscreen (spec §4). A single click only acts once the
     /// double-click interval has passed without a second click, so a double
     /// click never also changes the image.
+    ///
+    /// On a zoomed image the press may instead start a drag, so it only
+    /// counts as a click once the button comes up without having moved
+    /// ([`Self::on_mouse_up`]).
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -396,29 +426,92 @@ impl ViewerView {
                 // pair with it) is a single click in its own right.
                 if let Some((area, _)) = self.pending_click.take() {
                     self.click_area(area, window, cx);
+                    // That click may have changed the image and so the zoom.
                 }
                 let area = ClickArea::at(event.position, window.viewport_size());
-                let wait = cx.spawn_in(window, async move |this, cx| {
-                    cx.background_executor()
-                        .timer(pointer::double_click_interval())
-                        .await;
-                    let _ = this.update_in(cx, |view, window, cx| {
-                        if let Some((area, this_task)) = view.pending_click.take() {
-                            // Dropping would cancel the task that is running.
-                            this_task.detach();
-                            view.click_area(area, window, cx);
-                        }
+                if self.zoom.is_fitted() {
+                    self.queue_click(area, window, cx);
+                } else {
+                    self.drag = Some(Drag {
+                        area,
+                        start: event.position,
+                        last: event.position,
+                        moved: false,
                     });
-                });
-                self.pending_click = Some((area, wait));
+                }
             }
             2 => {
                 self.pending_click = None;
+                self.drag = None;
                 log::debug!("toggling fullscreen (double click)");
                 window.toggle_fullscreen();
             }
             // A third click in a row would toggle straight back.
             _ => {}
+        }
+    }
+
+    /// Acts on a single click in `area` once the double-click interval has
+    /// passed without a second click.
+    fn queue_click(&mut self, area: ClickArea, window: &mut Window, cx: &mut Context<Self>) {
+        let wait = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(pointer::double_click_interval())
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                if let Some((area, this_task)) = view.pending_click.take() {
+                    // Dropping would cancel the task that is running.
+                    this_task.detach();
+                    view.click_area(area, window, cx);
+                }
+            });
+        });
+        self.pending_click = Some((area, wait));
+    }
+
+    /// Drags a zoomed image around once the pointer has moved far enough from
+    /// where the button went down.
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Released outside the window: neither a click nor more dragging.
+            self.drag = None;
+            cx.notify();
+            return;
+        }
+        if !drag.moved {
+            let dx = f32::from(event.position.x - drag.start.x);
+            let dy = f32::from(event.position.y - drag.start.y);
+            if dx.hypot(dy) <= DRAG_THRESHOLD {
+                return;
+            }
+            drag.moved = true;
+        }
+        let delta = (
+            f32::from(event.position.x - drag.last.x),
+            f32::from(event.position.y - drag.last.y),
+        );
+        drag.last = event.position;
+        if let Some((viewport, image)) = self.zoom_geometry(window) {
+            self.zoom.pan(delta, viewport, image);
+        }
+        cx.notify();
+    }
+
+    /// Ends a press on a zoomed image: without movement it was a click.
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = self.drag.take() {
+            if !drag.moved {
+                self.queue_click(drag.area, window, cx);
+            }
+            cx.notify();
         }
     }
 
@@ -449,16 +542,68 @@ impl ViewerView {
         }
     }
 
-    /// Wheel down = →, wheel up = ←, one image per notch (spec §4).
+    /// Wheel down = →, wheel up = ←, one image per notch (spec §4). With Ctrl
+    /// held the wheel zooms instead, around the pointer (spec §5).
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.modifiers.control {
+            self.zoom_by_wheel(event, window, cx);
+            return;
+        }
         if let Some(step) = self.wheel.feed(&event.delta) {
             self.step_image(step, window, cx);
         }
+    }
+
+    /// Ctrl + wheel: up magnifies, down shrinks back towards the fit, keeping
+    /// the image point under the pointer in place.
+    fn zoom_by_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(factor) = self.zoom_factor else {
+            return;
+        };
+        let Some(notches) = pointer::wheel_notches(&event.delta) else {
+            return;
+        };
+        let Some((viewport, image)) = self.zoom_geometry(window) else {
+            return;
+        };
+        let cursor = (f32::from(event.position.x), f32::from(event.position.y));
+        let max_scale = zoom::max_scale(viewport, image, window.scale_factor());
+        self.zoom
+            .zoom_at(factor.powf(notches), cursor, viewport, image, max_scale);
+        if self.zoom.is_fitted() {
+            self.drag = None;
+        }
+        cx.notify();
+    }
+
+    /// The window and image sizes zoom is worked out from, if an image is on
+    /// screen.
+    fn zoom_geometry(&self, window: &Window) -> Option<((f32, f32), (f32, f32))> {
+        let Content::Gallery(gallery) = &self.content else {
+            return None;
+        };
+        let viewport = window.viewport_size();
+        let image = gallery.image.size(0);
+        Some((
+            (f32::from(viewport.width), f32::from(viewport.height)),
+            (image.width.0 as f32, image.height.0 as f32),
+        ))
+    }
+
+    /// Back to fitting the window, for a new image.
+    fn reset_zoom(&mut self) {
+        self.zoom = Zoom::fitted();
+        self.drag = None;
     }
 
     /// Moves one image within the current folder, wrapping from the last image
@@ -584,6 +729,7 @@ impl ViewerView {
         if !self.prefetch.holds(&previous) && !Arc::ptr_eq(&previous, &gallery.image) {
             self.orphaned.push(previous);
         }
+        self.reset_zoom();
         self.show_caption(cx);
         cx.notify();
     }
@@ -725,6 +871,7 @@ impl ViewerView {
         }
         self.release_textures(window);
         self.schedule_decodes(window, cx);
+        self.reset_zoom();
         self.show_caption(cx);
         cx.notify();
     }
@@ -784,13 +931,34 @@ impl ViewerView {
         gallery_near(folder.to_path_buf(), library::list_images(folder), index)
     }
 
-    /// The image surface. Zoom would be added here: the element already owns
-    /// the full window, so a future zoom only changes how the image is fitted
-    /// and offset inside it (spec §5).
-    fn render_image(&self, image: &Arc<RenderImage>) -> impl IntoElement {
-        img(image.clone())
-            .object_fit(ObjectFit::Contain)
+    /// The image surface: fitted to the window, or magnified and placed by
+    /// the zoom inside a full-window frame that clips it (spec §5).
+    fn render_image(&self, image: &Arc<RenderImage>, window: &Window) -> AnyElement {
+        if self.zoom.is_fitted() {
+            return img(image.clone())
+                .object_fit(ObjectFit::Contain)
+                .size_full()
+                .into_any_element();
+        }
+        let viewport = window.viewport_size();
+        let size = image.size(0);
+        let (x, y, w, h) = self.zoom.layout(
+            (f32::from(viewport.width), f32::from(viewport.height)),
+            (size.width.0 as f32, size.height.0 as f32),
+        );
+        div()
             .size_full()
+            .relative()
+            .overflow_hidden()
+            .child(
+                img(image.clone())
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h)),
+            )
+            .into_any_element()
     }
 
     /// The caption box, centred near the bottom. It has no mouse handlers, so
@@ -853,6 +1021,12 @@ impl Render for ViewerView {
             self.windowed_bounds = Some(window.window_bounds().get_bounds());
         }
 
+        let cursor = match (&self.drag, self.zoom.is_fitted()) {
+            (Some(drag), _) if drag.moved => CursorStyle::ClosedHand,
+            (_, false) => CursorStyle::OpenHand,
+            _ => CursorStyle::Arrow,
+        };
+
         div()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -866,8 +1040,11 @@ impl Render for ViewerView {
             .on_action(cx.listener(Self::on_refresh_listing))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_action(cx.listener(Self::on_quit))
+            .cursor(cursor)
             .size_full()
             .relative()
             .flex()
@@ -875,7 +1052,7 @@ impl Render for ViewerView {
             .justify_center()
             .bg(rgb(0x000000))
             .child(match &self.content {
-                Content::Gallery(gallery) => self.render_image(&gallery.image).into_any_element(),
+                Content::Gallery(gallery) => self.render_image(&gallery.image, window),
                 Content::Message(text) => div()
                     .p_8()
                     .text_color(rgb(0xE6E6E6))

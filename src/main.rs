@@ -22,6 +22,7 @@ mod report;
 #[cfg(test)]
 mod test_support;
 mod viewer;
+mod zoom;
 
 use std::path::PathBuf;
 
@@ -74,6 +75,7 @@ fn main() {
 fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: Config) {
     let overlay_duration = config.overlay.duration();
     let prefetch = config.prefetch.clone();
+    let zoom_factor = config.zoom.factor_per_notch();
     let folder_history = config.folder_history.clone();
     let startup = decide_startup(requested_path, config);
 
@@ -87,7 +89,15 @@ fn run(primary: Option<ipc::Primary>, requested_path: Option<PathBuf>, config: C
             let mut viewer: Option<Entity<ViewerView>> = None;
             let opened = cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| {
-                    ViewerView::new(startup, overlay_duration, &prefetch, folder_history, window, cx)
+                    ViewerView::new(
+                        startup,
+                        overlay_duration,
+                        &prefetch,
+                        zoom_factor,
+                        folder_history,
+                        window,
+                        cx,
+                    )
                 });
                 viewer = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))

@@ -85,6 +85,18 @@ fn lines_per_notch() -> f32 {
     }
 }
 
+/// Wheel movement as a (possibly fractional) number of notches, up positive.
+/// Pixel deltas from touchpads are ignored, as for stepping through images.
+pub fn wheel_notches(delta: &ScrollDelta) -> Option<f32> {
+    match delta {
+        ScrollDelta::Lines(lines) => {
+            let per_notch = lines_per_notch();
+            (per_notch > 0. && lines.y != 0.).then(|| lines.y / per_notch)
+        }
+        ScrollDelta::Pixels(_) => None,
+    }
+}
+
 /// Collects wheel movement until it adds up to one notch, so a high-resolution
 /// wheel that reports fractions of a notch still moves one image per notch.
 #[derive(Debug, Default)]
