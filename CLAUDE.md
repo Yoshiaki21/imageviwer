@@ -210,7 +210,7 @@ cargo run -- /path/to/image.png
 - 2026-10-28: JPEG XL（`.jxl`）の読み込みに対応（`src/media/jxl.rs`、jxl-rs 0.8）。アニメーションは先頭フレームのみ。
   Windows 版と KDE 版の実機で確認。
 - 2026-11-11: Ctrl+ホイールのズームと拡大中のドラッグ移動を追加（`src/zoom.rs`、`[zoom] step_percent`）。
-  仕様 §5・§12 を改めた。KDE 版の実機で確認。
+  仕様 §5・§12 を改めた。KDE 版の実機で確認。Windows 版の実機確認はまだ（後で行う）。
 
 ---
 
